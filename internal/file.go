@@ -49,21 +49,17 @@ type FileHandle struct {
 	lastWriteError error
 
 	// read
-	reader        io.ReadCloser
-	readBufOffset int64
-
-	// parallel read
-	buffers           []*S3ReadBuffer
-	existingReadahead int
-	seqReadAmount     uint64
-	numOOORead        uint64 // number of out of order read
+	cache *FileCache
+	//metrics
+	reporter *metricReporter
 }
 
-const MAX_READAHEAD = uint32(100 * 1024 * 1024)
-const READAHEAD_CHUNK = uint32(20 * 1024 * 1024)
+const MAX_READAHEAD = uint32(30 * 1024 * 1024)
+const READAHEAD_CHUNK = uint32(5 * 1024 * 1024)
 
-func NewFileHandle(in *Inode) *FileHandle {
+func NewFileHandle(in *Inode, reporter *metricReporter) *FileHandle {
 	fh := &FileHandle{inode: in}
+	fh.reporter = reporter
 	return fh
 }
 
@@ -352,140 +348,6 @@ func (fh *FileHandle) WriteFile(offset int64, data []byte) (err error) {
 	return
 }
 
-type S3ReadBuffer struct {
-	s3     *s3.S3
-	offset uint64
-	size   uint32
-	buf    *Buffer
-}
-
-func (b S3ReadBuffer) Init(fh *FileHandle, offset uint64, size uint32) *S3ReadBuffer {
-	fs := fh.inode.fs
-	b.s3 = fs.s3
-	b.offset = offset
-	b.size = size
-
-	mbuf := MBuf{}.Init(fh.poolHandle, uint64(size), false)
-	if mbuf == nil {
-		return nil
-	}
-
-	b.buf = Buffer{}.Init(mbuf, func() (io.ReadCloser, error) {
-		params := &s3.GetObjectInput{
-			Bucket: &fs.bucket,
-			Key:    fs.key(*fh.inode.FullName()),
-		}
-
-		bytes := fmt.Sprintf("bytes=%v-%v", offset, offset+uint64(size)-1)
-		params.Range = &bytes
-
-		req, resp := fs.s3.GetObjectRequest(params)
-
-		err := req.Send()
-		if err != nil {
-			return nil, mapAwsError(err)
-		}
-
-		return resp.Body, nil
-	})
-
-	return &b
-}
-
-func (b *S3ReadBuffer) Read(offset uint64, p []byte) (n int, err error) {
-	if b.offset == offset {
-		n, err = io.ReadFull(b.buf, p)
-		if n != 0 && err == io.ErrUnexpectedEOF {
-			err = nil
-		}
-		if n > 0 {
-			if uint32(n) > b.size {
-				panic(fmt.Sprintf("read more than available %v %v", n, b.size))
-			}
-
-			b.offset += uint64(n)
-			b.size -= uint32(n)
-		}
-
-		return
-	} else {
-		panic(fmt.Sprintf("not the right buffer, expecting %v got %v, %v left", b.offset, offset, b.size))
-		err = errors.New(fmt.Sprintf("not the right buffer, expecting %v got %v", b.offset, offset))
-		return
-	}
-}
-
-func (fh *FileHandle) readFromReadAhead(offset uint64, buf []byte) (bytesRead int, err error) {
-	var nread int
-	for len(fh.buffers) != 0 {
-		nread, err = fh.buffers[0].Read(offset+uint64(bytesRead), buf)
-		bytesRead += nread
-		if err != nil {
-			return
-		}
-
-		if fh.buffers[0].size == 0 {
-			// we've exhausted the first buffer
-			fh.buffers[0].buf.Close()
-			fh.buffers = fh.buffers[1:]
-		}
-
-		buf = buf[nread:]
-
-		if len(buf) == 0 {
-			// we've filled the user buffer
-			return
-		}
-	}
-
-	return
-}
-
-func (fh *FileHandle) readAhead(offset uint64, needAtLeast int) (err error) {
-	existingReadahead := uint32(0)
-	for _, b := range fh.buffers {
-		existingReadahead += b.size
-	}
-
-	readAheadAmount := MAX_READAHEAD
-
-	for readAheadAmount-existingReadahead >= READAHEAD_CHUNK {
-		off := offset + uint64(existingReadahead)
-		remaining := fh.inode.Attributes.Size - off
-
-		// only read up to readahead chunk each time
-		size := MinUInt32(readAheadAmount-existingReadahead, READAHEAD_CHUNK)
-		// but don't read past the file
-		size = uint32(MinUInt64(uint64(size), remaining))
-
-		if size != 0 {
-			fh.inode.logFuse("readahead", off, size, existingReadahead)
-
-			readAheadBuf := S3ReadBuffer{}.Init(fh, off, size)
-			if readAheadBuf != nil {
-				fh.buffers = append(fh.buffers, readAheadBuf)
-				existingReadahead += size
-			} else {
-				if existingReadahead != 0 {
-					// don't do more readahead now, but don't fail, cross our
-					// fingers that we will be able to allocate the buffers
-					// later
-					return nil
-				} else {
-					return syscall.ENOMEM
-				}
-			}
-		}
-
-		if size != READAHEAD_CHUNK {
-			// that was the last remaining chunk to readahead
-			break
-		}
-	}
-
-	return nil
-}
-
 func (fh *FileHandle) ReadFile(offset int64, buf []byte) (bytesRead int, err error) {
 	fh.inode.logFuse("ReadFile", offset, len(buf))
 	defer func() {
@@ -504,6 +366,10 @@ func (fh *FileHandle) ReadFile(offset int64, buf []byte) (bytesRead int, err err
 	nwant := len(buf)
 	var nread int
 
+	if fh.cache == nil {
+		fh.cache = NewFileCache(fh, fh.reporter)
+	}
+
 	for bytesRead < nwant && err == nil {
 		nread, err = fh.readFile(offset+int64(bytesRead), buf[bytesRead:])
 		if nread > 0 {
@@ -516,11 +382,6 @@ func (fh *FileHandle) ReadFile(offset int64, buf []byte) (bytesRead int, err err
 
 func (fh *FileHandle) readFile(offset int64, buf []byte) (bytesRead int, err error) {
 	defer func() {
-		if bytesRead > 0 {
-			fh.readBufOffset += int64(bytesRead)
-			fh.seqReadAmount += uint64(bytesRead)
-		}
-
 		fh.inode.logFuse("< readFile", bytesRead, err)
 	}()
 
@@ -542,64 +403,16 @@ func (fh *FileHandle) readFile(offset int64, buf []byte) (bytesRead int, err err
 		fh.poolHandle = fs.bufferPool
 	}
 
-	if fh.readBufOffset != offset {
-		// XXX out of order read, maybe disable prefetching
-		fh.inode.logFuse("out of order read", offset, fh.readBufOffset)
-
-		fh.readBufOffset = offset
-		fh.seqReadAmount = 0
-		if fh.reader != nil {
-			fh.reader.Close()
-			fh.reader = nil
-		}
-
-		if fh.buffers != nil {
-			// we misdetected
-			fh.numOOORead++
-		}
-
-		for _, b := range fh.buffers {
-			b.buf.Close()
-		}
-		fh.buffers = nil
-	}
-
-	if !fs.flags.Cheap && fh.seqReadAmount >= uint64(READAHEAD_CHUNK) && fh.numOOORead < 3 {
-		if fh.reader != nil {
-			fh.inode.logFuse("cutover to the parallel algorithm")
-			fh.reader.Close()
-			fh.reader = nil
-		}
-
-		err = fh.readAhead(uint64(offset), len(buf))
-		if err == nil {
-			bytesRead, err = fh.readFromReadAhead(uint64(offset), buf)
-			return
-		} else {
-			// fall back to read serially
-			fh.inode.logFuse("not enough memory, fallback to serial read")
-			fh.seqReadAmount = 0
-			for _, b := range fh.buffers {
-				b.buf.Close()
-			}
-			fh.buffers = nil
-		}
-	}
-
-	bytesRead, err = fh.readFromStream(offset, buf)
+	read, err := fh.cache.Read(uint64(offset), buf)
+	bytesRead = int(read)
 
 	return
 }
 
 func (fh *FileHandle) Release() {
 	// read buffers
-	for _, b := range fh.buffers {
-		b.buf.Close()
-	}
-	fh.buffers = nil
-
-	if fh.reader != nil {
-		fh.reader.Close()
+	if fh.cache != nil {
+		fh.cache.Release()
 	}
 
 	// write buffers
@@ -623,55 +436,6 @@ func (fh *FileHandle) Release() {
 	}
 
 	fh.inode.fileHandles -= 1
-}
-
-func (fh *FileHandle) readFromStream(offset int64, buf []byte) (bytesRead int, err error) {
-	defer func() {
-		if fh.inode.fs.flags.DebugFuse {
-			fh.inode.logFuse("< readFromStream", bytesRead)
-		}
-	}()
-
-	if uint64(offset) >= fh.inode.Attributes.Size {
-		// nothing to read
-		return
-	}
-
-	fs := fh.inode.fs
-
-	if fh.reader == nil {
-		params := &s3.GetObjectInput{
-			Bucket: &fs.bucket,
-			Key:    fs.key(*fh.inode.FullName()),
-		}
-
-		if offset != 0 {
-			bytes := fmt.Sprintf("bytes=%v-", offset)
-			params.Range = &bytes
-		}
-
-		req, resp := fs.s3.GetObjectRequest(params)
-
-		err = req.Send()
-		if err != nil {
-			return bytesRead, mapAwsError(err)
-		}
-
-		fh.reader = resp.Body
-	}
-
-	bytesRead, err = fh.reader.Read(buf)
-	if err != nil {
-		if err != io.EOF {
-			fh.inode.logFuse("< readFromStream error", bytesRead, err)
-		}
-		// always retry error on read
-		fh.reader.Close()
-		fh.reader = nil
-		err = nil
-	}
-
-	return
 }
 
 func (fh *FileHandle) flushSmallFile() (err error) {

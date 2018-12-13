@@ -241,6 +241,24 @@ func NewApp() (app *cli.App) {
 				Name:  "f",
 				Usage: "Run goofys in foreground.",
 			},
+
+			/////////////////////////
+			// Cloud Watch config
+			/////////////////////////
+			cli.StringFlag{
+				Name:  "cw-log-group",
+				Usage: "Cloud watch log group name",
+			},
+
+			cli.StringFlag{
+				Name:  "cw-id",
+				Usage: "Name used for cloud watch logs and metrics.",
+			},
+
+			cli.StringFlag{
+				Name:  "cw-metric-ns",
+				Usage: "Namespace for metrics",
+			},
 		},
 	}
 
@@ -308,6 +326,11 @@ type FlagStorage struct {
 	DebugFuse  bool
 	DebugS3    bool
 	Foreground bool
+
+	// Cloud watch
+	CwLogGroup string
+	CwMetricNs string
+	CwId       string
 }
 
 func parseOptions(m map[string]string, s string) {
@@ -376,6 +399,11 @@ func PopulateFlags(c *cli.Context) (ret *FlagStorage) {
 		DebugFuse:  c.Bool("debug_fuse"),
 		DebugS3:    c.Bool("debug_s3"),
 		Foreground: c.Bool("f"),
+
+		// Cloudwatch
+		CwId:       c.String("cw-id"),
+		CwMetricNs: c.String("cw-metric-ns"),
+		CwLogGroup: c.String("cw-log-group"),
 	}
 
 	// Handle the repeated "-o" flag.

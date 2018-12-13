@@ -2,10 +2,10 @@ package goofys
 
 import (
 	"github.com/kahing/goofys/internal"
+	"net"
 
 	"context"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -58,6 +58,11 @@ type Config struct {
 	DebugFuse  bool
 	DebugS3    bool
 	Foreground bool
+
+	// Cloud watch
+	CwLogGroup string
+	CwMetricNs string
+	CwId       string
 }
 
 func Mount(
@@ -87,9 +92,10 @@ func Mount(
 			ExpectContinueTimeout: 10 * time.Second,
 		},
 		Timeout: flags.HTTPTimeout,
-	})
+	}).
+		WithS3DisableContentMD5Validation(true)
 
-	if(config.AccessKey != "") {
+	if config.AccessKey != "" {
 		awsConfig.Credentials = credentials.NewStaticCredentials(config.AccessKey, config.SecretKey, "")
 	} else if len(flags.Profile) > 0 {
 		awsConfig.Credentials = credentials.NewSharedCredentials("", flags.Profile)

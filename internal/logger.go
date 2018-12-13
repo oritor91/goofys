@@ -22,6 +22,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/kdar/logrus-cloudwatchlogs"
 	"github.com/sirupsen/logrus"
 	logrus_syslog "github.com/sirupsen/logrus/hooks/syslog"
 )
@@ -34,7 +36,18 @@ var fuseLog = GetLogger("fuse")
 
 var syslogHook *logrus_syslog.SyslogHook
 
-func InitLoggers(logToSyslog bool) {
+func InitLoggers(logToSyslog bool, cwGroup string, cwName string) {
+	if len(cwGroup) > 0 && len(cwName) > 0 {
+		cfg := aws.NewConfig().WithRegion("us-east-1")
+		hook, err := logrus_cloudwatchlogs.NewHook(cwGroup, cwName, cfg)
+		if err != nil {
+			panic("Could not create cloudwatch log")
+		}
+		for _, l := range loggers {
+			l.Hooks.Add(hook)
+		}
+	}
+
 	if logToSyslog {
 		var err error
 		syslogHook, err = logrus_syslog.NewSyslogHook("", "", syslog.LOG_DEBUG, "")

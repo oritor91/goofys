@@ -13,3 +13,6 @@
 [submodule "vendor/github.com/jtolds/gls"]
 	path = vendor/github.com/jtolds/gls
 	url = https://github.com/jtolds/gls
+[submodule "vendor/github.com/kdar/logrus-cloudwatchlogs"]
+	path = vendor/github.com/kdar/logrus-cloudwatchlogs
+	url = https://github.com/kdar/logrus-cloudwatchlogs

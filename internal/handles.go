@@ -64,9 +64,18 @@ type Inode struct {
 	// the refcnt is an exception, it's protected by the global lock
 	// Goofys.mu
 	refcnt uint64
+
+	// metrics
+	reporter *metricReporter
 }
 
 func NewInode(fs *Goofys, parent *Inode, name *string, fullName *string) (inode *Inode) {
+	flags := fs.flags
+	var reporter *metricReporter
+	if len(flags.CwMetricNs) > 0 && len(flags.CwId) > 0 {
+		reporter = NewMetricReporter(flags.CwMetricNs, flags.CwId)
+	}
+
 	inode = &Inode{
 		Name:       name,
 		fs:         fs,
@@ -74,6 +83,7 @@ func NewInode(fs *Goofys, parent *Inode, name *string, fullName *string) (inode 
 		Parent:     parent,
 		s3Metadata: make(map[string][]byte),
 		refcnt:     1,
+		reporter:   reporter,
 	}
 
 	return
@@ -342,7 +352,7 @@ func (parent *Inode) Create(
 		Mtime: now,
 	}
 
-	fh = NewFileHandle(inode)
+	fh = NewFileHandle(inode, inode.reporter)
 	fh.poolHandle = fs.bufferPool
 	fh.dirty = true
 	inode.fileHandles = 1
@@ -676,8 +686,7 @@ func (inode *Inode) OpenFile() (fh *FileHandle, err error) {
 
 	inode.mu.Lock()
 	defer inode.mu.Unlock()
-
-	fh = NewFileHandle(inode)
+	fh = NewFileHandle(inode, inode.reporter)
 	inode.fileHandles += 1
 	return
 }

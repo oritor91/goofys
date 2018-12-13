@@ -18,6 +18,7 @@ package main
 import (
 	goofys "github.com/kahing/goofys/api"
 	. "github.com/kahing/goofys/internal"
+	"runtime/pprof"
 
 	"fmt"
 	"os"
@@ -186,7 +187,7 @@ func main() {
 				panic(fmt.Sprintf("unable to daemonize: %v", err))
 			}
 
-			InitLoggers(!flags.Foreground && child == nil)
+			InitLoggers(!flags.Foreground && child == nil, flags.CwLogGroup, flags.CwId)
 
 			if child != nil {
 				// attempt to wait for child to notify parent
@@ -204,7 +205,21 @@ func main() {
 			}
 
 		} else {
-			InitLoggers(!flags.Foreground)
+			InitLoggers(!flags.Foreground, flags.CwLogGroup, flags.CwId)
+		}
+
+		cpuprofile := "cpu.log"
+		// cpuprofile := ""
+
+		if cpuprofile != "" {
+			f, err := os.Create(cpuprofile)
+			if err != nil {
+				log.Fatal("could not create CPU profile: ", err)
+			}
+			if err := pprof.StartCPUProfile(f); err != nil {
+				log.Fatal("could not start CPU profile: ", err)
+			}
+			defer pprof.StopCPUProfile()
 		}
 
 		// Mount the file system.
