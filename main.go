@@ -208,8 +208,8 @@ func main() {
 			InitLoggers(!flags.Foreground, flags.CwLogGroup, flags.CwId)
 		}
 
-		cpuprofile := "cpu.log"
-		// cpuprofile := ""
+		// cpuprofile := "cpu.log"
+		cpuprofile := ""
 
 		if cpuprofile != "" {
 			f, err := os.Create(cpuprofile)

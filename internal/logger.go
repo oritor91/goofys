@@ -41,22 +41,22 @@ func InitLoggers(logToSyslog bool, cwGroup string, cwName string) {
 		cfg := aws.NewConfig().WithRegion("us-east-1")
 		hook, err := logrus_cloudwatchlogs.NewHook(cwGroup, cwName, cfg)
 		if err != nil {
-			panic("Could not create cloudwatch log")
-		}
-		for _, l := range loggers {
-			l.Hooks.Add(hook)
+			log.Println(fmt.Sprintf("Could not create cloudwatch log: %s", err.Error()))
+		} else {
+			for _, l := range loggers {
+				l.Hooks.Add(hook)
+			}
 		}
 	}
 
 	if logToSyslog {
-		var err error
-		syslogHook, err = logrus_syslog.NewSyslogHook("", "", syslog.LOG_DEBUG, "")
+		hook, err := logrus_syslog.NewSyslogHook("", "", syslog.LOG_DEBUG, "")
 		if err != nil {
-			panic("Unable to connect to local syslog daemon")
-		}
-
-		for _, l := range loggers {
-			l.Hooks.Add(syslogHook)
+			log.Println(fmt.Sprintf("Unable to connect to local syslog daemon: %s", err.Error()))
+		} else {
+			for _, l := range loggers {
+				l.Hooks.Add(hook)
+			}
 		}
 	}
 }

@@ -14,7 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 )
 
-const CacheChunkSize = uint32(512 * 1024)
+const CacheChunkSize = uint32(4 * 1024 * 1024)
 const MaxChunksForCache = int(256 * 1024 * 1024 / CacheChunkSize)
 const ReadAheadCount = uint64(MaxChunksForCache / 4)
 const MaxReadDuration = time.Millisecond * 100
@@ -181,7 +181,6 @@ type S3ReadBuffer struct {
 	read   int
 
 	downloader  sync.Once
-	lock        sync.Mutex
 	stopReading bool
 	downloadErr error
 	readPending bool
@@ -244,6 +243,7 @@ func (b *S3ReadBuffer) download(retryCount int) {
 				b.downloadErr = err
 				break
 			}
+
 			b.read += n
 			readBuf = readBuf[n:]
 			if !b.readPending {
