@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"runtime"
 	"strings"
 	"sync"
@@ -46,8 +47,8 @@ func (cache FileCache) Release() {
 	}
 }
 
-func (cache FileCache) GetSize() uint64 {
-	return cache.fh.inode.Attributes.Size
+func GetSize(fh *FileHandle) uint64 {
+	return fh.inode.Attributes.Size
 }
 
 func offsetToIdx(offset uint64) uint32 {
@@ -59,7 +60,7 @@ func idxToOffset(idx uint32) uint64 {
 }
 
 func (cache FileCache) readAheadOf(idx uint64) {
-	maxChunk := cache.GetSize() / uint64(CacheChunkSize)
+	maxChunk := GetSize(cache.fh) / uint64(CacheChunkSize)
 	start := idx + 1
 	end := MinUInt64(maxChunk, idx+ReadAheadCount)
 	buffers := make([]*S3ReadBuffer, end-start+1)
@@ -70,7 +71,7 @@ func (cache FileCache) readAheadOf(idx uint64) {
 		}
 	}
 	for i := len(buffers) - 1; i >= 0; i-- {
-		if buffers[i] != nil && !buffers[i].stopReading {
+		if buffers[i] != nil && !buffers[i].abort {
 			cache.pushToLru(buffers[i])
 		}
 		if i == 0 {
@@ -114,6 +115,7 @@ func (cache FileCache) read(offset uint64, buff []byte) (read uint64, err error)
 		fuseLog.Debugln("Read from buffer", cache.fh.inode.Id, readOffset, buffer.offset, readTo)
 		read, err := buffer.Read(int(readOffset), buff[:readTo])
 		if err != nil {
+			fuseLog.Errorln(err)
 			return nread, err
 		}
 		cache.pushToLru(buffer)
@@ -176,12 +178,15 @@ func (cache FileCache) getBuffer(idx uint32) (buffer *S3ReadBuffer, err error) {
 type S3ReadBuffer struct {
 	s3     *s3.S3
 	offset uint64
+	size   int
 	buf    []byte
 	fh     *FileHandle
-	read   int
 
-	downloader  sync.Once
-	stopReading bool
+	downloading bool
+	read        int
+
+	lock        sync.Mutex
+	abort       bool
 	downloadErr error
 	readPending bool
 }
@@ -189,80 +194,146 @@ type S3ReadBuffer struct {
 func (b S3ReadBuffer) Init(fh *FileHandle, offset uint64, buf []byte) *S3ReadBuffer {
 	fs := fh.inode.fs
 	b.s3 = fs.s3
+	b.read = 0
+	b.size = len(buf)
+	totalSize := GetSize(fh) - offset
+	if uint64(b.size) > totalSize {
+		b.size = int(totalSize) // cast to int is ok since totalSize is smaller than size which is int
+	}
 	b.offset = offset
 	b.buf = buf
 	b.fh = fh
-	go b.downloader.Do(b.tryDownloading)
+	b.downloading = true
+	go b.download()
 	return &b
 }
 
 func (b *S3ReadBuffer) freeBuffer() []byte {
 	res := b.buf
-	b.stopReading = true
-	b.downloader.Do(b.tryDownloading)
+	b.abort = true
+	for {
+		b.lock.Lock()
+		downloading := b.downloading
+		b.lock.Unlock()
+		if !downloading {
+			break
+		}
+	}
+	// after the loop, download has stopped
 	b.buf = nil
 	fuseLog.Debugln("Release buffer", b.fh.inode.Id, b.offset)
 	return res
 }
 
-func (b *S3ReadBuffer) tryDownloading() {
-	b.download(3)
-}
-
-func (b *S3ReadBuffer) download(retryCount int) {
-	if retryCount == 0 {
-		b.fh.inode.errFuse("Download failed, no more retries", b.offset)
-		return
-	}
+func (b *S3ReadBuffer) tryDownload() (err error, retry bool) {
 	fs := b.fh.inode.fs
 	params := &s3.GetObjectInput{
 		Bucket: &fs.bucket,
 		Key:    fs.key(*b.fh.inode.FullName()),
 	}
 
-	bytes := fmt.Sprintf("bytes=%v-%v", b.offset, b.offset+uint64(len(b.buf))-1)
+	bytes := fmt.Sprintf("bytes=%v-%v", b.offset+uint64(b.read), b.offset+uint64(b.read+b.size)-1)
 	params.Range = &bytes
 
-	req, resp := fs.s3.GetObjectRequest(params)
+	out, err := b.s3.GetObject(params)
 
-	err := req.Send()
-	b.downloadErr = err
-	if err == nil {
-		defer resp.Body.Close()
-		b.read = 0
-		readBuf := b.buf
-		for b.read < len(b.buf) && !b.stopReading {
-			n, err := resp.Body.Read(readBuf)
+	if err != nil {
+		fmt.Printf("read: %d, range: %s\n", b.read, bytes)
+		return err, false
+	}
+	defer out.Body.Close()
+	for b.read < len(b.buf) && !b.abort {
+		n, err := out.Body.Read(b.buf[b.read:])
 
-			if err != nil {
-				if strings.Contains(err.Error(), "Client.Timeout exceeded while reading body") {
-					fuseLog.Warnln("Timeout, retrying ", b.fh.inode.Id, b.offset)
-					b.download(retryCount - 1)
-					return
+		b.read += n
+
+		if err != nil {
+			if err == io.EOF {
+				if b.read != b.size {
+					fuseLog.Errorf("Unexpected EOF. read: %d, bytes: %s, wanted: %d", b.read, bytes, b.size)
 				}
-				b.downloadErr = err
-				break
+				return err, false
 			}
+			if strings.Contains(err.Error(), "SlowDown: Please reduce your request rate") {
+				time.Sleep(time.Millisecond * time.Duration(100+rand.Int31n(3000)))
+				return err, true
+			}
+			if strings.Contains(err.Error(), "Client.Timeout exceeded while reading body") {
+				return err, true
+			}
+			return err, false
+		}
 
-			b.read += n
-			readBuf = readBuf[n:]
-			if !b.readPending {
-				runtime.Gosched()
-			}
+		if !b.readPending {
+			b.lock.Unlock()
+			runtime.Gosched()
+			b.lock.Lock()
 		}
 	}
+	return nil, false
+}
 
-	fuseLog.Debugln("Download finished", b.fh.inode.Id, b.offset, len(b.buf))
+func (b *S3ReadBuffer) download() {
+	b.lock.Lock()
+	if b.read >= b.size {
+		fuseLog.Debugf("already downloaded %d\n", offsetToIdx(b.offset))
+		b.downloading = false
+		b.lock.Unlock()
+		return
+	}
+	fuseLog.Debugf("Starting download %d\n", offsetToIdx(b.offset))
+	for i := 0; i < 3; i++ {
+		b.downloadErr = nil
+		err, retry := b.tryDownload()
+		b.downloadErr = err
+		if !retry {
+			break
+		}
+		if err == nil {
+			break
+		}
+	}
+	fuseLog.Debugf("Done download: %s, buffer: %d, read: %d\n", b.downloadErr, offsetToIdx(b.offset), b.read)
+	b.downloading = false
+	b.lock.Unlock()
 }
 
 func (b *S3ReadBuffer) Read(offset int, p []byte) (n int, err error) {
 	b.readPending = true
-	if offset+len(p) > b.read {
-		b.downloader.Do(b.tryDownloading)
+	wantToRead := len(p)
+	if b.size-offset < wantToRead {
+		fuseLog.Debugf("Changing want. old: %d, new %d\n", wantToRead, b.size)
+		wantToRead = b.size - offset
 	}
-	if b.downloadErr != nil && b.downloadErr != io.EOF {
-		b.fh.inode.errFuse("Error download", b.downloadErr)
-		return 0, b.downloadErr
+
+	var started bool
+
+	for {
+		b.lock.Lock()
+		if wantToRead+offset <= b.read {
+			b.lock.Unlock()
+			break
+		}
+		if !b.downloading {
+			if !started {
+				fuseLog.Debugf("Restarting download %d\n", offsetToIdx(b.offset))
+				started = true
+				go b.download()
+			} else {
+				if wantToRead+offset <= b.read {
+					b.lock.Unlock()
+					break
+				}
+				err = b.downloadErr
+				if err != nil && err != io.EOF {
+					b.lock.Unlock()
+					return 0, err
+				}
+				b.lock.Unlock()
+				return 0, fmt.Errorf("%d download finished, but no error and not enough downloaded, read: %d, offset: %d, want: %d", offsetToIdx(b.offset), b.read, offset, wantToRead)
+			}
+		}
+		b.lock.Unlock()
 	}
 	copied := copy(p, b.buf[offset:])
 	return copied, nil
