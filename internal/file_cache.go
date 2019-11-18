@@ -16,19 +16,38 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 )
 
-const CacheChunkSize = uint32(1 * 1024 * 1024)
-const MaxChunksForCache = int(256 * 1024 * 1024 / CacheChunkSize)
-const ReadAheadCount = uint64(1)
+// Note these are overwritetn in any case by the flags
+var RcMinChunks = uint32(64)
+var RcMaxChunks = uint32(256)
+var RcChunksPerFile = uint32(64)
+var RcChunkSize = uint32(4 * 1024 * 1024)
+var RcReadAheadCount = uint32(1)
+var RcDownloadRetries = uint32(5)
+
+var buffers map[string]*S3ReadBuffer
+var lru *list.List
+
+var maxChunks uint32
+var desiredMaxChunks uint32
+
+// MaxReadDuration Used by metric reporter as the threshold for slow reads
 const MaxReadDuration = time.Millisecond * 100
 
-const MaxDownloadRetries = 5
+func init() {
+	maxChunks = RcMinChunks
+	desiredMaxChunks = maxChunks
+	buffers = make(map[string]*S3ReadBuffer)
+	lru = list.New()
+}
+
+func changeDesiredMaxChunks(delta uint32) {
+	desiredMaxChunks += delta
+	maxChunks = MaxUInt32(MinUInt32(desiredMaxChunks, RcMaxChunks), RcMinChunks)
+}
 
 type FileCache struct {
-	buffers   map[uint32]*list.Element
-	fh        *FileHandle
-	lru       *list.List
-	maxChunks int
-	reporter  *metricReporter
+	fh       *FileHandle
+	reporter *metricReporter
 
 	returnedToOs     uint64
 	downloadedFromS3 uint64
@@ -36,28 +55,34 @@ type FileCache struct {
 
 func NewFileCache(fh *FileHandle, reporter *metricReporter) *FileCache {
 	fc := FileCache{}
-	fc.lru = list.New()
-	fc.buffers = make(map[uint32]*list.Element)
 	fc.fh = fh
-	fc.maxChunks = MaxChunksForCache
 	fc.reporter = reporter
+
+	changeDesiredMaxChunks(RcMaxChunks)
 	return &fc
 }
 
-func (cache *FileCache) Release() {
-	for cache.lru.Len() > 0 {
-		elem := cache.lru.Back()
-		cache.lru.Remove(elem)
-		buff := elem.Value.(*S3ReadBuffer)
-		cache.releaseBuffer(buff)
-	}
-	template := "Closing file cache for %s. Total read from s3: %d, total returned to OS: %d\n"
-	fuseLog.Infof(template, cache.fh.inode.FullName(), cache.downloadedFromS3, cache.returnedToOs)
+func releaseBuffer(buff *S3ReadBuffer) []byte {
+	res := buff.freeBuffer()
+	lru.Remove(buff.lruElem)
+	delete(buffers, buff.idx.String())
+	return res
 }
 
-func (cache *FileCache) releaseBuffer(buff *S3ReadBuffer) {
-	buff.freeBuffer() // Mounted successfully
-	atomic.AddUint64(&cache.downloadedFromS3, uint64(buff.read))
+func (cache *FileCache) Release() {
+	changeDesiredMaxChunks(-RcChunksPerFile)
+	for len(buffers) > int(maxChunks) {
+		elem := lru.Back()
+		if elem == nil {
+			break
+		}
+		buff := elem.Value.(*S3ReadBuffer)
+		releaseBuffer(buff)
+	}
+	template := "Closing file cache for %s. Total read from s3: %d, total returned to OS: %d"
+	s3down := atomic.LoadUint64(&cache.downloadedFromS3)
+	fuseLog.Infof(template, *cache.fh.inode.FullName(), s3down, cache.returnedToOs)
+	fuseLog.Infof("Current maxChunks: %d, lru len: %d, map size %d", maxChunks, lru.Len(), len(buffers))
 }
 
 func GetSize(fh *FileHandle) uint64 {
@@ -65,20 +90,21 @@ func GetSize(fh *FileHandle) uint64 {
 }
 
 func offsetToIdx(offset uint64) uint32 {
-	return uint32(offset / uint64(CacheChunkSize))
+	return uint32(offset / uint64(RcChunkSize))
 }
 
 func idxToOffset(idx uint32) uint64 {
-	return uint64(idx) * uint64(CacheChunkSize)
+	return uint64(idx) * uint64(RcChunkSize)
 }
 
-func (cache *FileCache) readAheadOf(idx uint64) {
-	maxChunk := GetSize(cache.fh) / uint64(CacheChunkSize)
+func (cache *FileCache) readAheadOf(idx uint32) {
+	maxChunk := uint32(GetSize(cache.fh) / uint64(RcChunkSize))
 	start := idx + 1
-	end := MinUInt64(maxChunk, idx+ReadAheadCount)
+	end := MinUInt32(maxChunk, idx+RcReadAheadCount)
 	buffers := make([]*S3ReadBuffer, end-start+1)
 	for i := start; i <= end; i++ {
-		buffer, err := cache.getBuffer(uint32(i))
+		buffIdx := s3BufferIdx{cache, idxToOffset(i)}
+		buffer, _, err := cache.getBuffer(buffIdx)
 		if err == nil {
 			buffers[i-start] = buffer // if readahead failed, next time we might succeed
 		}
@@ -109,13 +135,21 @@ func (cache *FileCache) Read(offset uint64, buff []byte) (read uint64, err error
 func (cache *FileCache) read(offset uint64, buff []byte) (read uint64, err error) {
 
 	expectToRead := uint64(len(buff))
-	startBuff := offset / uint64(CacheChunkSize)
-	endBuff := (offset + uint64(len(buff)) - 1) / uint64(CacheChunkSize)
+	startBuff := uint32(offset / uint64(RcChunkSize))
+	endBuff := uint32((offset + uint64(len(buff)) - 1) / uint64(RcChunkSize))
 	buffers := make([]*S3ReadBuffer, endBuff-startBuff+1)
 	fuseLog.Debugln("About to read ", cache.fh.inode.Id, startBuff, endBuff)
 
 	for i := startBuff; i <= endBuff; i++ {
-		buffer, err := cache.getBuffer(uint32(i))
+		buffIdx := s3BufferIdx{cache, idxToOffset(i)}
+		buffer, hit, err := cache.getBuffer(buffIdx)
+		var cacheHitTxt string
+		if hit {
+			cacheHitTxt = "hit  "
+		} else {
+			cacheHitTxt = "miss "
+		}
+		fuseLog.Debug("cache ", cacheHitTxt, buffer.idx)
 		if err != nil {
 			return 0, err
 		}
@@ -127,7 +161,7 @@ func (cache *FileCache) read(offset uint64, buff []byte) (read uint64, err error
 	for i := startBuff; i <= endBuff; i++ {
 		buffer := buffers[i-startBuff]
 		readOffset := offset - buffer.offset
-		readTo := MinUInt64(uint64(CacheChunkSize)-readOffset, uint64(len(buff)))
+		readTo := MinUInt64(uint64(RcChunkSize)-readOffset, uint64(len(buff)))
 		fuseLog.Debugln("Read from buffer", cache.fh.inode.Id, readOffset, buffer.offset, readTo)
 		read, err := buffer.Read(int(readOffset), buff[:readTo])
 		if err != nil {
@@ -151,52 +185,60 @@ func (cache *FileCache) read(offset uint64, buff []byte) (read uint64, err error
 }
 
 func (cache *FileCache) pushToLru(buffer *S3ReadBuffer) {
-	idx := offsetToIdx(buffer.offset)
-	elem, ok := cache.buffers[idx]
+	idx := buffer.idx.String()
+	_, ok := buffers[idx]
 	if !ok {
-		fuseLog.Debug("Added to lru ", cache.fh.inode.Id, idx, cache.lru.Len())
-		elem = cache.lru.PushFront(buffer)
-		cache.buffers[idx] = elem
+		fuseLog.Debug("Added to lru ", cache.fh.inode.Id, idx, lru.Len())
+		elem := lru.PushFront(buffer)
+		buffer.lruElem = elem
+		buffers[idx] = buffer
 	} else {
-		cache.lru.MoveToFront(elem)
+		lru.MoveToFront(buffer.lruElem)
 	}
 }
 
-func (cache *FileCache) getBuffer(idx uint32) (buffer *S3ReadBuffer, err error) {
-	elem, ok := cache.buffers[idx]
+func (cache *FileCache) getBuffer(idx s3BufferIdx) (buffer *S3ReadBuffer, hit bool, err error) {
+	b, ok := buffers[idx.String()]
 	if ok {
-		b := elem.Value.(*S3ReadBuffer)
-		return b, nil
+		return b, true, nil
 	}
 
 	var buf []byte
-	fuseLog.Debug("Lru size ", cache.fh.inode.Id, cache.lru.Len())
-	if cache.lru.Len() == cache.maxChunks {
-		elem = cache.lru.Back()
+	fuseLog.Debug("Lru size ", cache.fh.inode.Id, lru.Len())
+	if lru.Len() == int(maxChunks) {
+		elem := lru.Back()
 		b := elem.Value.(*S3ReadBuffer)
-
-		cache.lru.Remove(elem)
-		delete(cache.buffers, offsetToIdx(b.offset))
-		cache.releaseBuffer(b)
-	} else if cache.lru.Len() > cache.maxChunks {
+		buf = releaseBuffer(b)
+	} else if lru.Len() > int(maxChunks) {
 		panic("did not expect more chunks than allowed.")
 	}
 
 	if buf == nil {
-		buf = make([]byte, CacheChunkSize)
+		buf = make([]byte, RcChunkSize)
 	}
-	fuseLog.Debug("Init buffer ", cache.fh.inode.Id, idx, idxToOffset(idx), CacheChunkSize)
-	buffer = S3ReadBuffer{}.Init(cache.fh, idxToOffset(idx), buf)
+	buffer = S3ReadBuffer{}.Init(cache, idx.offset, buf)
+	fuseLog.Debug("Init buffer ", cache.fh.inode.Id, buffer.idx, buffer.offset, RcChunkSize)
 	cache.pushToLru(buffer)
-	return buffer, nil
+	return buffer, false, nil
+}
+
+type s3BufferIdx struct {
+	fc     *FileCache
+	offset uint64
+}
+
+func (idx s3BufferIdx) String() string {
+	return fmt.Sprintf("%s;%d", *idx.fc.fh.inode.FullName(), offsetToIdx(idx.offset))
 }
 
 type S3ReadBuffer struct {
+	idx     s3BufferIdx
+	lruElem *list.Element
+
 	s3     *s3.S3
 	offset uint64
 	size   int
 	buf    []byte
-	fh     *FileHandle
 
 	downloading bool
 	read        int
@@ -207,19 +249,22 @@ type S3ReadBuffer struct {
 	readPending bool
 }
 
-func (b S3ReadBuffer) Init(fh *FileHandle, offset uint64, buf []byte) *S3ReadBuffer {
-	fs := fh.inode.fs
+func (b S3ReadBuffer) Init(fc *FileCache, offset uint64, buf []byte) *S3ReadBuffer {
+	fs := fc.fh.inode.fs
 	b.s3 = fs.s3
 	b.read = 0
 	b.size = len(buf)
-	totalSize := GetSize(fh) - offset
+	totalSize := GetSize(fc.fh) - offset
 	if uint64(b.size) > totalSize {
 		b.size = int(totalSize) // cast to int is ok since totalSize is smaller than size which is int
 	}
 	b.offset = offset
 	b.buf = buf
-	b.fh = fh
 	b.downloading = true
+
+	b.idx.offset = offset
+	b.idx.fc = fc
+
 	go b.download()
 	return &b
 }
@@ -237,15 +282,16 @@ func (b *S3ReadBuffer) freeBuffer() []byte {
 	}
 	// after the loop, download has stopped
 	b.buf = nil
-	fuseLog.Debugln("Release buffer", b.fh.inode.Id, b.offset)
+	fuseLog.Debugln("Release buffer", b.idx)
 	return res
 }
 
 func (b *S3ReadBuffer) tryDownload() (err error, retry bool) {
-	fs := b.fh.inode.fs
+	inode := b.idx.fc.fh.inode
+	fs := inode.fs
 	params := &s3.GetObjectInput{
 		Bucket: &fs.bucket,
-		Key:    fs.key(*b.fh.inode.FullName()),
+		Key:    fs.key(*inode.FullName()),
 	}
 
 	bytes := fmt.Sprintf("bytes=%v-%v", b.offset+uint64(b.read), b.offset+uint64(b.read+b.size)-1)
@@ -262,6 +308,7 @@ func (b *S3ReadBuffer) tryDownload() (err error, retry bool) {
 		n, err := out.Body.Read(b.buf[b.read:])
 
 		b.read += n
+		atomic.AddUint64(&b.idx.fc.downloadedFromS3, uint64(n))
 
 		if err != nil {
 			if err == io.EOF {
@@ -298,7 +345,7 @@ func (b *S3ReadBuffer) download() {
 		return
 	}
 	fuseLog.Debugf("Starting download %d\n", offsetToIdx(b.offset))
-	for i := 0; i < MaxDownloadRetries; i++ {
+	for i := 0; i < int(RcDownloadRetries); i++ {
 		b.downloadErr = nil
 		err, retry := b.tryDownload()
 		b.downloadErr = err

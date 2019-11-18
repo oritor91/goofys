@@ -63,6 +63,14 @@ type Config struct {
 	CwLogGroup string
 	CwMetricNs string
 	CwId       string
+
+	//Read cache
+	RcMinChunks       uint32
+	RcMaxChunks       uint32
+	RcChunksPerFile   uint32
+	RcChunkSize       uint32
+	RcReadAheadCount  uint32
+	RcDownloadRetries uint32
 }
 
 func Mount(
@@ -187,6 +195,13 @@ func Mount(
 			}
 		}()
 	}
+
+	internal.RcMinChunks = flags.RcMinChunks
+	internal.RcMaxChunks = flags.RcMaxChunks
+	internal.RcChunksPerFile = flags.RcChunksPerFile
+	internal.RcChunkSize = flags.RcChunkSize
+	internal.RcReadAheadCount = flags.RcReadAheadCount
+	internal.RcDownloadRetries = flags.RcDownloadRetries
 
 	return
 }

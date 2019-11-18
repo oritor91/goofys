@@ -66,6 +66,12 @@ TUNING OPTIONS:
 AWS S3 OPTIONS:
    {{range category .Flags "aws"}}{{.}}
    {{end}}
+CLOUD WATCH OPTIONS:
+   {{range category .Flags "cloud-watch"}}{{.}}
+   {{end}}
+READ CACHE OPTIONS:
+   {{range category .Flags "read-cache"}}{{.}}
+   {{end}}
 MISC OPTIONS:
    {{range category .Flags "misc"}}{{.}}
    {{end}}{{end}}{{if .Copyright }}
@@ -243,6 +249,45 @@ func NewApp() (app *cli.App) {
 			},
 
 			/////////////////////////
+			// RAM cache config
+			/////////////////////////
+			cli.UintFlag{
+				Name:  "rc-min-chunks",
+				Value: 64,
+				Usage: "Minimum number of chunks to be allocated for the internal buffer",
+			},
+
+			cli.UintFlag{
+				Name:  "rc-max-chunks",
+				Value: 128,
+				Usage: "Maximum number of chunks to be allocated for the internal buffer",
+			},
+
+			cli.UintFlag{
+				Name:  "rc-chunks-per-file",
+				Value: 64,
+				Usage: "Number of chunks to allocate for the internal buffer per file. Note that the total number is still limited by rc-max-chunks",
+			},
+
+			cli.UintFlag{
+				Name:  "rc-chunk-size",
+				Value: 4 * 1024 * 1024,
+				Usage: "Chunk size in bytes",
+			},
+
+			cli.UintFlag{
+				Name:  "rc-read-ahead-count",
+				Value: 1,
+				Usage: "Number of chunks to read ahead on each read request",
+			},
+
+			cli.UintFlag{
+				Name:  "rc-download-retries",
+				Value: 5,
+				Usage: "Number of retries when downloading chunk",
+			},
+
+			/////////////////////////
 			// Cloud Watch config
 			/////////////////////////
 			cli.StringFlag{
@@ -279,6 +324,14 @@ func NewApp() (app *cli.App) {
 
 	for _, f := range []string{"help, h", "debug_fuse", "debug_s3", "version, v", "f"} {
 		flagCategories[f] = "misc"
+	}
+
+	for _, f := range []string{"cw-log-group", "cw-id", "cw-metric-ns"} {
+		flagCategories[f] = "cloud-watch"
+	}
+
+	for _, f := range []string{"rc-min-chunks", "rc-max-chunks", "rc-chunks-per-file", "rc-chunk-size", "rc-read-ahead-count", "rc-download-retries"} {
+		flagCategories[f] = "read-cache"
 	}
 
 	cli.HelpPrinter = func(w io.Writer, templ string, data interface{}) {
@@ -331,6 +384,14 @@ type FlagStorage struct {
 	CwLogGroup string
 	CwMetricNs string
 	CwId       string
+
+	//Read cache
+	RcMinChunks       uint32
+	RcMaxChunks       uint32
+	RcChunksPerFile   uint32
+	RcChunkSize       uint32
+	RcReadAheadCount  uint32
+	RcDownloadRetries uint32
 }
 
 func parseOptions(m map[string]string, s string) {
@@ -404,6 +465,14 @@ func PopulateFlags(c *cli.Context) (ret *FlagStorage) {
 		CwId:       c.String("cw-id"),
 		CwMetricNs: c.String("cw-metric-ns"),
 		CwLogGroup: c.String("cw-log-group"),
+
+		//Read cache
+		RcMinChunks:       uint32(c.Uint("rc-min-chunks")),
+		RcMaxChunks:       uint32(c.Uint("rc-max-chunks")),
+		RcChunksPerFile:   uint32(c.Uint("rc-chunks-per-file")),
+		RcChunkSize:       uint32(c.Uint("rc-chunk-size")),
+		RcReadAheadCount:  uint32(c.Uint("rc-read-ahead-count")),
+		RcDownloadRetries: uint32(c.Uint("rc-download-retries")),
 	}
 
 	// Handle the repeated "-o" flag.
