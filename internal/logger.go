@@ -36,9 +36,9 @@ var fuseLog = GetLogger("fuse")
 
 var syslogHook *logrus_syslog.SyslogHook
 
-func InitLoggers(logToSyslog bool, cwGroup string, cwName string) {
-	if len(cwGroup) > 0 && len(cwName) > 0 {
-		cfg := aws.NewConfig().WithRegion("us-east-1")
+func InitLoggers(logToSyslog bool, cwRegion, cwGroup, cwName string) {
+	if cwRegion != "" && cwGroup != "" && cwName != "" {
+		cfg := aws.NewConfig().WithRegion(cwRegion)
 		hook, err := logrus_cloudwatchlogs.NewHook(cwGroup, cwName, cfg)
 		if err != nil {
 			log.Println(fmt.Sprintf("Could not create cloudwatch log: %s", err.Error()))

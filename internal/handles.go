@@ -73,7 +73,7 @@ func NewInode(fs *Goofys, parent *Inode, name *string, fullName *string) (inode 
 	flags := fs.flags
 	var reporter *metricReporter
 	if len(flags.CwMetricNs) > 0 && len(flags.CwId) > 0 {
-		reporter = NewMetricReporter(flags.CwMetricNs, flags.CwId)
+		reporter = NewMetricReporter(fs.sess, flags.CwMetricNs, flags.CwId)
 	}
 
 	inode = &Inode{

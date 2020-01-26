@@ -16,14 +16,12 @@ type metricReporter struct {
 	cwId           string
 }
 
-func NewMetricReporter(cwMetric string, cwId string) *metricReporter {
+func NewMetricReporter(sess *session.Session, cwMetric, cwId string) *metricReporter {
 	res := &metricReporter{}
 	res.lastUpdateTime = time.Now()
 	res.cwId = cwId
 	res.cwMetric = cwMetric
 
-	cfg := aws.NewConfig().WithRegion("us-east-1")
-	sess := session.New(cfg)
 	res.cw = cloudwatch.New(sess)
 	return res
 }

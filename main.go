@@ -187,7 +187,7 @@ func main() {
 				panic(fmt.Sprintf("unable to daemonize: %v", err))
 			}
 
-			InitLoggers(!flags.Foreground && child == nil, flags.CwLogGroup, flags.CwId)
+			InitLoggers(!flags.Foreground && child == nil, flags.Region, flags.CwLogGroup, flags.CwId)
 
 			if child != nil {
 				// attempt to wait for child to notify parent
@@ -205,7 +205,7 @@ func main() {
 			}
 
 		} else {
-			InitLoggers(!flags.Foreground, flags.CwLogGroup, flags.CwId)
+			InitLoggers(!flags.Foreground, flags.Region, flags.CwLogGroup, flags.CwId)
 		}
 
 		// cpuprofile := "cpu.log"
