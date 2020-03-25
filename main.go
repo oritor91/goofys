@@ -16,8 +16,8 @@
 package main
 
 import (
-	goofys "github.com/kahing/goofys/api"
-	. "github.com/kahing/goofys/internal"
+	goofys "github.com/zzvlad/goofys/api"
+	. "github.com/zzvlad/goofys/internal"
 	"runtime/pprof"
 
 	"fmt"
@@ -152,7 +152,7 @@ func main() {
 
 	app.Action = func(c *cli.Context) (err error) {
 		// We should get two arguments exactly. Otherwise error out.
-		if len(c.Args()) != 2 {
+		if c.Args().Len() != 2 {
 			fmt.Fprintf(
 				os.Stderr,
 				"Error: %s takes exactly two arguments.\n\n",
@@ -162,7 +162,7 @@ func main() {
 		}
 
 		// Populate and parse flags.
-		bucketName := c.Args()[0]
+		bucketName := c.Args().Get(0)
 		flags = PopulateFlags(c)
 		if flags == nil {
 			cli.ShowAppHelp(c)

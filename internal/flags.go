@@ -34,7 +34,7 @@ var flagCategories map[string]string
 // Set up custom help text for goofys; in particular the usage section.
 func filterCategory(flags []cli.Flag, category string) (ret []cli.Flag) {
 	for _, f := range flags {
-		if flagCategories[f.GetName()] == category {
+		if flagCategories[f.Names()[0]] == category {
 			ret = append(ret, f)
 		}
 	}
@@ -94,7 +94,7 @@ func NewApp() (app *cli.App) {
 		Writer:   os.Stderr,
 		Flags: []cli.Flag{
 
-			cli.BoolFlag{
+			&cli.BoolFlag{
 				Name:  "help, h",
 				Usage: "Print this help text and exit successfully.",
 			},
@@ -103,12 +103,12 @@ func NewApp() (app *cli.App) {
 			// File system
 			/////////////////////////
 
-			cli.StringSliceFlag{
+			&cli.StringSliceFlag{
 				Name:  "o",
 				Usage: "Additional system-specific mount options. Be careful!",
 			},
 
-			cli.StringFlag{
+			&cli.StringFlag{
 				Name: "cache",
 				Usage: "Directory to use for data cache. " +
 					"Requires catfs and `-o allow_other'. " +
@@ -116,25 +116,25 @@ func NewApp() (app *cli.App) {
 					"(ex: --cache \"--free:10%:$HOME/cache\") (default: off)",
 			},
 
-			cli.IntFlag{
+			&cli.IntFlag{
 				Name:  "dir-mode",
 				Value: 0755,
 				Usage: "Permission bits for directories. (default: 0755)",
 			},
 
-			cli.IntFlag{
+			&cli.IntFlag{
 				Name:  "file-mode",
 				Value: 0644,
 				Usage: "Permission bits for files. (default: 0644)",
 			},
 
-			cli.IntFlag{
+			&cli.IntFlag{
 				Name:  "uid",
 				Value: uid,
 				Usage: "UID owner of all inodes.",
 			},
 
-			cli.IntFlag{
+			&cli.IntFlag{
 				Name:  "gid",
 				Value: gid,
 				Usage: "GID owner of all inodes.",
@@ -144,14 +144,14 @@ func NewApp() (app *cli.App) {
 			// S3
 			/////////////////////////
 
-			cli.StringFlag{
+			&cli.StringFlag{
 				Name:  "endpoint",
 				Value: "",
 				Usage: "The non-AWS endpoint to connect to." +
 					" Possible values: http://127.0.0.1:8081/",
 			},
 
-			cli.StringFlag{
+			&cli.StringFlag{
 				Name:  "region",
 				Value: "us-east-1",
 				Usage: "The region to connect to. Usually this is auto-detected." +
@@ -160,38 +160,38 @@ func NewApp() (app *cli.App) {
 					"sa-east-1, cn-north-1. Must be provided for cloudwatch logs to work.",
 			},
 
-			cli.StringFlag{
+			&cli.StringFlag{
 				Name:  "storage-class",
 				Value: "STANDARD",
 				Usage: "The type of storage to use when writing objects." +
 					" Possible values: REDUCED_REDUNDANCY, STANDARD, STANDARD_IA.",
 			},
 
-			cli.StringFlag{
+			&cli.StringFlag{
 				Name:  "profile",
 				Usage: "Use a named profile from $HOME/.aws/credentials instead of \"default\"",
 			},
 
-			cli.BoolFlag{
+			&cli.BoolFlag{
 				Name:  "use-content-type",
 				Usage: "Set Content-Type according to file extension and /etc/mime.types (default: off)",
 			},
 
 			/// http://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectPUT.html
 			/// See http://docs.aws.amazon.com/AmazonS3/latest/dev/UsingServerSideEncryption.html
-			cli.BoolFlag{
+			&cli.BoolFlag{
 				Name:  "sse",
 				Usage: "Enable basic server-side encryption at rest (SSE-S3) in S3 for all writes (default: off)",
 			},
 
-			cli.StringFlag{
+			&cli.StringFlag{
 				Name:  "sse-kms",
 				Usage: "Enable KMS encryption (SSE-KMS) for all writes using this particular KMS `key-id`. Leave blank to Use the account's CMK - customer master key (default: off)",
 				Value: "",
 			},
 
 			/// http://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html#canned-acl
-			cli.StringFlag{
+			&cli.StringFlag{
 				Name:  "acl",
 				Usage: "The canned ACL to apply to the object. Possible values: private, public-read, public-read-write, authenticated-read, aws-exec-read, bucket-owner-read, bucket-owner-full-control (default: off)",
 				Value: "",
@@ -201,29 +201,29 @@ func NewApp() (app *cli.App) {
 			// Tuning
 			/////////////////////////
 
-			cli.BoolFlag{
+			&cli.BoolFlag{
 				Name:  "cheap",
 				Usage: "Reduce S3 operation costs at the expense of some performance (default: off)",
 			},
 
-			cli.BoolFlag{
+			&cli.BoolFlag{
 				Name:  "no-implicit-dir",
 				Usage: "Assume all directory objects (\"dir/\") exist (default: off)",
 			},
 
-			cli.DurationFlag{
+			&cli.DurationFlag{
 				Name:  "stat-cache-ttl",
 				Value: time.Minute,
 				Usage: "How long to cache StatObject results and inode attributes.",
 			},
 
-			cli.DurationFlag{
+			&cli.DurationFlag{
 				Name:  "type-cache-ttl",
 				Value: time.Minute,
 				Usage: "How long to cache name -> file/dir mappings in directory " +
 					"inodes.",
 			},
-			cli.DurationFlag{
+			&cli.DurationFlag{
 				Name:  "http-timeout",
 				Value: 30 * time.Second,
 				Usage: "Set the timeout on HTTP requests to S3",
@@ -233,17 +233,17 @@ func NewApp() (app *cli.App) {
 			// Debugging
 			/////////////////////////
 
-			cli.BoolFlag{
+			&cli.BoolFlag{
 				Name:  "debug_fuse",
 				Usage: "Enable fuse-related debugging output.",
 			},
 
-			cli.BoolFlag{
+			&cli.BoolFlag{
 				Name:  "debug_s3",
 				Usage: "Enable S3-related debugging output.",
 			},
 
-			cli.BoolFlag{
+			&cli.BoolFlag{
 				Name:  "f",
 				Usage: "Run goofys in foreground.",
 			},
@@ -251,37 +251,37 @@ func NewApp() (app *cli.App) {
 			/////////////////////////
 			// RAM cache config
 			/////////////////////////
-			cli.UintFlag{
+			&cli.UintFlag{
 				Name:  "rc-min-chunks",
 				Value: 64,
 				Usage: "Minimum number of chunks to be allocated for the internal buffer",
 			},
 
-			cli.UintFlag{
+			&cli.UintFlag{
 				Name:  "rc-max-chunks",
 				Value: 128,
 				Usage: "Maximum number of chunks to be allocated for the internal buffer",
 			},
 
-			cli.UintFlag{
+			&cli.UintFlag{
 				Name:  "rc-chunks-per-file",
 				Value: 64,
 				Usage: "Number of chunks to allocate for the internal buffer per file. Note that the total number is still limited by rc-max-chunks",
 			},
 
-			cli.UintFlag{
+			&cli.UintFlag{
 				Name:  "rc-chunk-size",
 				Value: 4 * 1024 * 1024,
 				Usage: "Chunk size in bytes",
 			},
 
-			cli.UintFlag{
+			&cli.UintFlag{
 				Name:  "rc-read-ahead-count",
 				Value: 1,
 				Usage: "Number of chunks to read ahead on each read request",
 			},
 
-			cli.UintFlag{
+			&cli.UintFlag{
 				Name:  "rc-download-retries",
 				Value: 5,
 				Usage: "Number of retries when downloading chunk",
@@ -290,17 +290,17 @@ func NewApp() (app *cli.App) {
 			/////////////////////////
 			// Cloud Watch config
 			/////////////////////////
-			cli.StringFlag{
+			&cli.StringFlag{
 				Name:  "cw-log-group",
 				Usage: "Cloud watch log group name",
 			},
 
-			cli.StringFlag{
+			&cli.StringFlag{
 				Name:  "cw-id",
 				Usage: "Name used for cloud watch logs and metrics.",
 			},
 
-			cli.StringFlag{
+			&cli.StringFlag{
 				Name:  "cw-metric-ns",
 				Usage: "Namespace for metrics",
 			},
@@ -480,7 +480,7 @@ func PopulateFlags(c *cli.Context) (ret *FlagStorage) {
 		parseOptions(flags.MountOptions, o)
 	}
 
-	flags.MountPointArg = c.Args()[1]
+	flags.MountPointArg = c.Args().Get(1)
 	flags.MountPoint = flags.MountPointArg
 	var err error
 
