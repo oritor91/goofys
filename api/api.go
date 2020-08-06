@@ -13,6 +13,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
 
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseutil"
@@ -106,7 +107,12 @@ func Mount(
 	if config.AccessKey != "" {
 		awsConfig.Credentials = credentials.NewStaticCredentials(config.AccessKey, config.SecretKey, "")
 	} else if len(flags.Profile) > 0 {
-		awsConfig.Credentials = credentials.NewSharedCredentials("", flags.Profile)
+		opts := session.Options{
+			Profile:           flags.Profile,
+			SharedConfigState: session.SharedConfigEnable,
+		}
+		s := session.Must(session.NewSessionWithOptions(opts))
+		awsConfig.Credentials = s.Config.Credentials
 	}
 
 	if len(flags.Endpoint) > 0 {
