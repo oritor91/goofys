@@ -300,8 +300,7 @@ func (b *S3ReadBuffer) tryDownload() (err error, retry bool) {
 	out, err := b.s3.GetObject(params)
 
 	if err != nil {
-		fmt.Printf("read: %d, range: %s\n", b.read, bytes)
-		return err, false
+		return err, true
 	}
 	defer out.Body.Close()
 	for b.read < len(b.buf) && !b.abort {
@@ -318,13 +317,12 @@ func (b *S3ReadBuffer) tryDownload() (err error, retry bool) {
 				return err, false
 			}
 			if strings.Contains(err.Error(), "SlowDown: Please reduce your request rate") {
-				time.Sleep(time.Millisecond * time.Duration(100+rand.Int31n(3000))) // TODO exponential
 				return err, true
 			}
 			if strings.Contains(err.Error(), "Client.Timeout exceeded while reading body") {
 				return err, true
 			}
-			return err, false
+			return err, true
 		}
 
 		if !b.readPending {
@@ -344,19 +342,31 @@ func (b *S3ReadBuffer) download() {
 		b.lock.Unlock()
 		return
 	}
-	fuseLog.Debugf("Starting download %d\n", offsetToIdx(b.offset))
+	inode := b.idx.fc.fh.inode
+	fs := inode.fs
+	params := &s3.GetObjectInput{
+		Bucket: &fs.bucket,
+		Key:    fs.key(*inode.FullName()),
+	}
+	fuseLog.Infof("Starting download: %s/%s Idx: %d\n", *params.Bucket, *params.Key, offsetToIdx(b.offset))
+	sleep_times := []int32{2000, 4000, 8000, 8000}
 	for i := 0; i < int(RcDownloadRetries); i++ {
 		b.downloadErr = nil
 		err, retry := b.tryDownload()
 		b.downloadErr = err
-		if !retry {
+		if !retry || uint32(i+1) == RcDownloadRetries {
 			break
 		}
 		if err == nil {
 			break
 		}
+		// we want to sleep for 0-1, 0-2, 0-4, 0-8 accessing sleep_times according to the retry attempt
+		// whould give us the desired result
+		sleep_milliseconds := rand.Int31n(sleep_times[i]) + int32(100*(i+1)) // 100 * i for minimal delay between attempts
+		fuseLog.Warnf("Got error: %s - Retry needed on attempt %d. Sleeping for %d seconds\n", err.Error(), i, sleep_milliseconds/1000)
+		time.Sleep(time.Duration(sleep_milliseconds) * time.Millisecond)
 	}
-	fuseLog.Debugf("Done download: %s, buffer: %d, read: %d\n", b.downloadErr, offsetToIdx(b.offset), b.read)
+	fuseLog.Infof("Done download: %s, buffer: %d, read: %d\n", b.downloadErr, offsetToIdx(b.offset), b.read)
 	b.downloading = false
 	b.lock.Unlock()
 }
