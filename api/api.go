@@ -1,7 +1,7 @@
 package goofys
 
 import (
-	"github.com/zzvlad/goofys/internal"
+	"github.com/oritor91/goofys/internal"
 	"net"
 
 	"context"

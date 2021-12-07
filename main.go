@@ -16,8 +16,8 @@
 package main
 
 import (
-	goofys "github.com/zzvlad/goofys/api"
-	. "github.com/zzvlad/goofys/internal"
+	goofys "github.com/oritor91/goofys/api"
+	. "github.com/oritor91/goofys/internal"
 	"runtime/pprof"
 
 	"fmt"
