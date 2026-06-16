@@ -17,8 +17,7 @@ package internal
 import (
 	. "gopkg.in/check.v1"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go-v2/aws"
 
 	"github.com/jacobsa/fuse"
 )
@@ -30,14 +29,12 @@ type AwsTest struct {
 var _ = Suite(&AwsTest{})
 
 func (s *AwsTest) SetUpSuite(t *C) {
-	awsConfig := &aws.Config{
-		Region:           aws.String("us-east-1"),
-		S3ForcePathStyle: aws.Bool(true),
+	awsConfig := aws.Config{
+		Region: "us-east-1",
 	}
 
 	s.fs = &Goofys{
-		awsConfig: awsConfig,
-		sess:      session.New(awsConfig),
+		awsConfig: &awsConfig,
 	}
 
 	s.fs.s3 = s.fs.newS3()
@@ -48,7 +45,7 @@ func (s *AwsTest) TestRegionDetection(t *C) {
 
 	err, isAws := s.fs.detectBucketLocationByHEAD()
 	t.Assert(err, IsNil)
-	t.Assert(*s.fs.awsConfig.Region, Equals, "eu-west-1")
+	t.Assert(s.fs.awsConfig.Region, Equals, "eu-west-1")
 	t.Assert(isAws, Equals, true)
 }
 

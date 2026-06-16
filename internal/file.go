@@ -15,16 +15,20 @@
 package internal
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"strconv"
 	"sync"
 	"syscall"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/jacobsa/fuse"
 )
@@ -77,27 +81,28 @@ func (fh *FileHandle) initMPU() {
 
 	fh.mpuKey = fh.inode.FullName()
 	fs := fh.inode.fs
+	ctx := context.Background()
 
 	params := &s3.CreateMultipartUploadInput{
 		Bucket:       &fs.bucket,
 		Key:          fs.key(*fh.mpuKey),
-		StorageClass: &fs.flags.StorageClass,
+		StorageClass: types.StorageClass(fs.flags.StorageClass),
 		ContentType:  fs.getMimeType(*fh.inode.FullName()),
 	}
 
 	if fs.flags.UseSSE {
-		params.ServerSideEncryption = &fs.sseType
+		params.ServerSideEncryption = fs.sseType
 		if fs.flags.UseKMS && fs.flags.KMSKeyID != "" {
 			params.SSEKMSKeyId = &fs.flags.KMSKeyID
 		}
 	}
 
 	if fs.flags.ACL != "" {
-		params.ACL = &fs.flags.ACL
+		params.ACL = types.ObjectCannedACL(fs.flags.ACL)
 	}
 
 	if !fs.gcs {
-		resp, err := fs.s3.CreateMultipartUpload(params)
+		resp, err := fs.s3.CreateMultipartUpload(ctx, params)
 
 		fh.mu.Lock()
 		defer fh.mu.Unlock()
@@ -105,30 +110,57 @@ func (fh *FileHandle) initMPU() {
 		if err != nil {
 			fh.lastWriteError = mapAwsError(err)
 			s3Log.Errorf("CreateMultipartUpload %v = %v", *fh.mpuKey, err)
+			return
 		}
 
 		s3Log.Debug(resp)
 
 		fh.mpuId = resp.UploadId
 	} else {
-		req, _ := fs.s3.CreateMultipartUploadRequest(params)
-		// get rid of ?uploads=
-		req.HTTPRequest.URL.RawQuery = ""
-		req.HTTPRequest.Header.Set("x-goog-resumable", "start")
+		// GCS resumable upload: start a resumable session using a plain HTTP POST
+		// The mpuId will hold the session URI returned in the Location header.
+		endpointURL := ""
+		if fs.awsConfig.BaseEndpoint != nil {
+			endpointURL = *fs.awsConfig.BaseEndpoint
+		}
+		uploadURL := fmt.Sprintf("%s/%s/%s?uploads", endpointURL, fs.bucket, *fs.key(*fh.mpuKey))
 
-		err := req.Send()
+		req, err := http.NewRequest("POST", uploadURL, bytes.NewReader([]byte{}))
 		if err != nil {
+			fh.mu.Lock()
+			defer fh.mu.Unlock()
 			fh.lastWriteError = mapAwsError(err)
 			s3Log.Errorf("CreateMultipartUpload %v = %v", *fh.mpuKey, err)
+			return
+		}
+		req.Header.Set("x-goog-resumable", "start")
+		if params.ContentType != nil {
+			req.Header.Set("Content-Type", *params.ContentType)
 		}
 
-		location := req.HTTPResponse.Header.Get("Location")
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			fh.mu.Lock()
+			defer fh.mu.Unlock()
+			fh.lastWriteError = mapAwsError(err)
+			s3Log.Errorf("CreateMultipartUpload GCS %v = %v", *fh.mpuKey, err)
+			return
+		}
+		defer resp.Body.Close()
+
+		location := resp.Header.Get("Location")
 		_, err = url.Parse(location)
 		if err != nil {
+			fh.mu.Lock()
+			defer fh.mu.Unlock()
 			fh.lastWriteError = mapAwsError(err)
 			s3Log.Errorf("CreateMultipartUpload %v = %v", *fh.mpuKey, err)
+			return
 		}
 
+		fh.mu.Lock()
+		defer fh.mu.Unlock()
 		fh.mpuId = &location
 	}
 
@@ -139,6 +171,7 @@ func (fh *FileHandle) initMPU() {
 
 func (fh *FileHandle) mpuPartNoSpawn(buf *MBuf, part int, total int64, last bool) (err error) {
 	fs := fh.inode.fs
+	ctx := context.Background()
 
 	fs.replicators.Take(1, true)
 	defer fs.replicators.Return(1)
@@ -155,14 +188,14 @@ func (fh *FileHandle) mpuPartNoSpawn(buf *MBuf, part int, total int64, last bool
 		params := &s3.UploadPartInput{
 			Bucket:     &fs.bucket,
 			Key:        fs.key(*fh.inode.FullName()),
-			PartNumber: aws.Int64(int64(part)),
+			PartNumber: aws.Int32(int32(part)),
 			UploadId:   fh.mpuId,
 			Body:       buf,
 		}
 
 		s3Log.Debug(params)
 
-		resp, err := fs.s3.UploadPart(params)
+		resp, err := fs.s3.UploadPart(ctx, params)
 		if err != nil {
 			return mapAwsError(err)
 		}
@@ -172,21 +205,7 @@ func (fh *FileHandle) mpuPartNoSpawn(buf *MBuf, part int, total int64, last bool
 		}
 		*en = resp.ETag
 	} else {
-		// the mpuId serves as authentication token so
-		// technically we don't need to sign this anymore and
-		// can just use a plain HTTP request, but going
-		// through aws-sdk-go anyway to get retry handling
-		params := &s3.PutObjectInput{
-			Bucket: &fs.bucket,
-			Key:    fs.key(*fh.inode.FullName()),
-			Body:   buf,
-		}
-
-		s3Log.Debug(params)
-
-		req, _ := fs.s3.PutObjectRequest(params)
-		req.HTTPRequest.URL, _ = url.Parse(*fh.mpuId)
-
+		// GCS resumable upload part: PUT to the session URI with Content-Range header
 		bufSize := buf.Len()
 		start := total - int64(bufSize)
 		end := total - 1
@@ -196,19 +215,24 @@ func (fh *FileHandle) mpuPartNoSpawn(buf *MBuf, part int, total int64, last bool
 		} else {
 			size = "*"
 		}
-
 		contentRange := fmt.Sprintf("bytes %v-%v/%v", start, end, size)
 
-		req.HTTPRequest.Header.Set("Content-Length", strconv.Itoa(bufSize))
-		req.HTTPRequest.Header.Set("Content-Range", contentRange)
+		req, reqErr := http.NewRequest("PUT", *fh.mpuId, buf)
+		if reqErr != nil {
+			return mapAwsError(reqErr)
+		}
+		req.Header.Set("Content-Length", strconv.Itoa(bufSize))
+		req.Header.Set("Content-Range", contentRange)
 
-		err = req.Send()
-		if err != nil {
-			if req.HTTPResponse.StatusCode == 308 {
-				err = nil
-			} else {
-				return mapAwsError(err)
-			}
+		client := &http.Client{}
+		resp, doErr := client.Do(req)
+		if doErr != nil {
+			return mapAwsError(doErr)
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != 200 && resp.StatusCode != 201 && resp.StatusCode != 308 {
+			return fmt.Errorf("GCS upload part returned status %v", resp.StatusCode)
 		}
 	}
 
@@ -449,6 +473,7 @@ func (fh *FileHandle) flushSmallFile() (err error) {
 	defer buf.Free()
 
 	fs := fh.inode.fs
+	ctx := context.Background()
 
 	storageClass := fs.flags.StorageClass
 	if fh.nextWriteOffset < 128*1024 && storageClass == "STANDARD_IA" {
@@ -459,25 +484,25 @@ func (fh *FileHandle) flushSmallFile() (err error) {
 		Bucket:       &fs.bucket,
 		Key:          fs.key(*fh.inode.FullName()),
 		Body:         buf,
-		StorageClass: &storageClass,
+		StorageClass: types.StorageClass(storageClass),
 		ContentType:  fs.getMimeType(*fh.inode.FullName()),
 	}
 
 	if fs.flags.UseSSE {
-		params.ServerSideEncryption = &fs.sseType
+		params.ServerSideEncryption = fs.sseType
 		if fs.flags.UseKMS && fs.flags.KMSKeyID != "" {
 			params.SSEKMSKeyId = &fs.flags.KMSKeyID
 		}
 	}
 
 	if fs.flags.ACL != "" {
-		params.ACL = &fs.flags.ACL
+		params.ACL = types.ObjectCannedACL(fs.flags.ACL)
 	}
 
 	fs.replicators.Take(1, true)
 	defer fs.replicators.Return(1)
 
-	_, err = fs.s3.PutObject(params)
+	_, err = fs.s3.PutObject(ctx, params)
 	if err != nil {
 		err = mapAwsError(err)
 		fh.lastWriteError = err
@@ -509,6 +534,7 @@ func (fh *FileHandle) FlushFile() (err error) {
 	}
 
 	fs := fh.inode.fs
+	ctx := context.Background()
 
 	// abort mpu on error
 	defer func() {
@@ -522,7 +548,7 @@ func (fh *FileHandle) FlushFile() (err error) {
 					}
 
 					fh.mpuId = nil
-					resp, _ := fs.s3.AbortMultipartUpload(params)
+					resp, _ := fs.s3.AbortMultipartUpload(ctx, params)
 					s3Log.Debug(resp)
 				}()
 			}
@@ -568,11 +594,11 @@ func (fh *FileHandle) FlushFile() (err error) {
 	}
 
 	if !fs.gcs {
-		parts := make([]*s3.CompletedPart, nParts)
+		parts := make([]types.CompletedPart, nParts)
 		for i := 0; i < nParts; i++ {
-			parts[i] = &s3.CompletedPart{
+			parts[i] = types.CompletedPart{
 				ETag:       fh.etags[i],
-				PartNumber: aws.Int64(int64(i + 1)),
+				PartNumber: aws.Int32(int32(i + 1)),
 			}
 		}
 
@@ -580,14 +606,14 @@ func (fh *FileHandle) FlushFile() (err error) {
 			Bucket:   &fs.bucket,
 			Key:      fs.key(*fh.mpuKey),
 			UploadId: fh.mpuId,
-			MultipartUpload: &s3.CompletedMultipartUpload{
+			MultipartUpload: &types.CompletedMultipartUpload{
 				Parts: parts,
 			},
 		}
 
 		s3Log.Debug(params)
 
-		resp, err := fs.s3.CompleteMultipartUpload(params)
+		resp, err := fs.s3.CompleteMultipartUpload(ctx, params)
 		if err != nil {
 			return mapAwsError(err)
 		}
@@ -601,7 +627,7 @@ func (fh *FileHandle) FlushFile() (err error) {
 
 	if *fh.mpuKey != *fh.inode.FullName() {
 		// the file was renamed
-		err = renameObject(fs, fh.nextWriteOffset, *fh.mpuKey, *fh.inode.FullName())
+		err = renameObject(ctx, fs, fh.nextWriteOffset, *fh.mpuKey, *fh.inode.FullName())
 	}
 
 	return

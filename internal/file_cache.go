@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,14 +10,17 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"container/list"
 
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/jacobsa/fuse"
 )
 
-// Note these are overwritetn in any case by the flags
+// Note these are overwritten in any case by the flags
 var RcMinChunks = uint32(64)
 var RcMaxChunks = uint32(256)
 var RcChunksPerFile = uint32(64)
@@ -135,6 +139,14 @@ func (cache *FileCache) Read(offset uint64, buff []byte) (read uint64, err error
 func (cache *FileCache) read(offset uint64, buff []byte) (read uint64, err error) {
 
 	expectToRead := uint64(len(buff))
+	fileSize := GetSize(cache.fh)
+	if offset >= fileSize {
+		return 0, io.EOF
+	}
+	if offset+expectToRead > fileSize {
+		expectToRead = fileSize - offset
+		buff = buff[:expectToRead]
+	}
 	startBuff := uint32(offset / uint64(RcChunkSize))
 	endBuff := uint32((offset + uint64(len(buff)) - 1) / uint64(RcChunkSize))
 	buffers := make([]*S3ReadBuffer, endBuff-startBuff+1)
@@ -228,14 +240,14 @@ type s3BufferIdx struct {
 }
 
 func (idx s3BufferIdx) String() string {
-	return fmt.Sprintf("%s;%d", *idx.fc.fh.inode.FullName(), offsetToIdx(idx.offset))
+	return fmt.Sprintf("%s/%s;%d", idx.fc.fh.inode.fs.bucket, *idx.fc.fh.inode.FullName(), offsetToIdx(idx.offset))
 }
 
 type S3ReadBuffer struct {
 	idx     s3BufferIdx
 	lruElem *list.Element
 
-	s3     *s3.S3
+	s3     *s3.Client
 	offset uint64
 	size   int
 	buf    []byte
@@ -289,6 +301,7 @@ func (b *S3ReadBuffer) freeBuffer() []byte {
 func (b *S3ReadBuffer) tryDownload() (err error, retry bool) {
 	inode := b.idx.fc.fh.inode
 	fs := inode.fs
+	ctx := context.Background()
 	params := &s3.GetObjectInput{
 		Bucket: &fs.bucket,
 		Key:    fs.key(*inode.FullName()),
@@ -297,9 +310,13 @@ func (b *S3ReadBuffer) tryDownload() (err error, retry bool) {
 	bytes := fmt.Sprintf("bytes=%v-%v", b.offset+uint64(b.read), b.offset+uint64(b.read+b.size)-1)
 	params.Range = &bytes
 
-	out, err := b.s3.GetObject(params)
+	out, err := b.s3.GetObject(ctx, params)
 
 	if err != nil {
+		mapped := mapAwsError(err)
+		if mapped == syscall.EACCES || mapped == fuse.ENOENT {
+			return mapped, false
+		}
 		return err, true
 	}
 	defer out.Body.Close()
@@ -408,6 +425,9 @@ func (b *S3ReadBuffer) Read(offset int, p []byte) (n int, err error) {
 		}
 		b.lock.Unlock()
 	}
-	copied := copy(p, b.buf[offset:])
+	copied := copy(p, b.buf[offset:offset+wantToRead])
 	return copied, nil
 }
+
+// ensure unused import is referenced
+var _ = aws.String

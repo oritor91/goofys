@@ -15,14 +15,16 @@
 package internal
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseops"
@@ -150,7 +152,7 @@ func (dh *DirHandle) listObjectsSlurp(prefix string) (resp *s3.ListObjectsOutput
 		Marker: marker,
 	}
 
-	resp, err = fs.s3.ListObjects(params)
+	resp, err = fs.s3.ListObjects(context.Background(), params)
 	if err != nil {
 		s3Log.Errorf("ListObjects %v = %v", params, err)
 		return
@@ -178,13 +180,13 @@ func (dh *DirHandle) listObjectsSlurp(prefix string) (resp *s3.ListObjectsOutput
 			continue
 		}
 
-		if sealed || !*resp.IsTruncated {
+		if sealed || !aws.ToBool(resp.IsTruncated) {
 			d.dir.DirTime = time.Now()
 			d.Attributes.Mtime = d.findChildMaxTime()
 		}
 	}
 
-	if *resp.IsTruncated {
+	if aws.ToBool(resp.IsTruncated) {
 		obj := resp.Contents[len(resp.Contents)-1]
 		// if we are done listing prefix, we are good
 		if strings.HasPrefix(*obj.Key, prefix) {
@@ -205,7 +207,8 @@ func (dh *DirHandle) listObjectsSlurp(prefix string) (resp *s3.ListObjectsOutput
 
 	// we only return this response if we are totally done with listing this dir
 	if resp != nil {
-		resp.IsTruncated = aws.Bool(false)
+		isTrunc := false
+		resp.IsTruncated = &isTrunc
 		resp.NextMarker = nil
 	}
 
@@ -247,7 +250,7 @@ func (dh *DirHandle) listObjects(prefix string) (resp *s3.ListObjectsOutput, err
 			Prefix:    &prefix,
 		}
 
-		resp, err := fs.s3.ListObjects(params)
+		resp, err := fs.s3.ListObjects(context.Background(), params)
 		if err != nil {
 			errListChan <- err
 		} else {
@@ -281,7 +284,7 @@ func (dh *DirHandle) listObjects(prefix string) (resp *s3.ListObjectsOutput, err
 	}
 }
 
-func objectToDirEntry(fs *Goofys, obj *s3.Object, name string, isDir bool) (en *DirHandleEntry) {
+func objectToDirEntry(fs *Goofys, obj types.Object, name string, isDir bool) (en *DirHandleEntry) {
 	if isDir {
 		en = &DirHandleEntry{
 			Name:       &name,
@@ -289,15 +292,16 @@ func objectToDirEntry(fs *Goofys, obj *s3.Object, name string, isDir bool) (en *
 			Attributes: &fs.rootAttrs,
 		}
 	} else {
+		sc := string(obj.StorageClass)
 		en = &DirHandleEntry{
 			Name: &name,
 			Type: fuseutil.DT_File,
 			Attributes: &InodeAttributes{
-				Size:  uint64(*obj.Size),
+				Size:  uint64(aws.ToInt64(obj.Size)),
 				Mtime: *obj.LastModified,
 			},
 			ETag:         obj.ETag,
-			StorageClass: obj.StorageClass,
+			StorageClass: &sc,
 		}
 	}
 
@@ -443,7 +447,7 @@ func (dh *DirHandle) ReadDir(offset fuseops.DirOffset) (en *DirHandleEntry, err 
 			en.Offset = fuseops.DirOffset(i+dh.BaseOffset) + 1 + 2
 		}
 
-		if *resp.IsTruncated {
+		if aws.ToBool(resp.IsTruncated) {
 			dh.Marker = resp.NextMarker
 		} else {
 			dh.Marker = nil

@@ -15,14 +15,14 @@
 package internal
 
 import (
+	"context"
+
 	. "gopkg.in/check.v1"
 
-	"golang.org/x/net/context"
-
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 type MinioTest struct {
@@ -32,28 +32,27 @@ type MinioTest struct {
 var _ = Suite(&MinioTest{})
 
 func (s *MinioTest) SetUpSuite(t *C) {
-	awsConfig := &aws.Config{
-		Credentials: credentials.NewStaticCredentials("Q3AM3UQ867SPQQA43P2F",
+	endpoint := "https://play.minio.io:9000"
+	awsConfig := aws.Config{
+		Credentials: credentials.NewStaticCredentialsProvider("Q3AM3UQ867SPQQA43P2F",
 			"zuf+tfteSlswRu7BJ86wekitnifILbZam1KYY3TG", ""),
-		Region:           aws.String("us-east-1"),
-		Endpoint:         aws.String("https://play.minio.io:9000"),
-		S3ForcePathStyle: aws.Bool(true),
+		Region:      "us-east-1",
+		BaseEndpoint: &endpoint,
 	}
 
 	s.fs = &Goofys{
-		awsConfig: awsConfig,
-		sess:      session.New(awsConfig),
+		awsConfig: &awsConfig,
 	}
 
 	s.fs.s3 = s.fs.newS3()
-	_, err := s.fs.s3.ListBuckets(nil)
+	_, err := s.fs.s3.ListBuckets(context.Background(), &s3.ListBucketsInput{})
 	t.Assert(err, IsNil)
 }
 
 func (s *MinioTest) SetUpTest(t *C) {
 	bucket := RandStringBytesMaskImprSrc(32)
 
-	_, err := s.fs.s3.CreateBucket(&s3.CreateBucketInput{
+	_, err := s.fs.s3.CreateBucket(context.Background(), &s3.CreateBucketInput{
 		Bucket: &bucket,
 	})
 	t.Assert(err, IsNil)
@@ -73,3 +72,6 @@ func (s *MinioTest) SetUpTest(t *C) {
 
 func (s *MinioTest) TestNoop(t *C) {
 }
+
+// suppress unused import
+var _ = types.StorageClass("")

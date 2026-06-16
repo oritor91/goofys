@@ -16,25 +16,24 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"mime"
 	"net/http"
 	"net/url"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/corehandlers"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go/middleware"
+	smithy "github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseops"
@@ -62,11 +61,10 @@ type Goofys struct {
 	umask uint32
 
 	awsConfig *aws.Config
-	sess      *session.Session
-	s3        *s3.S3
+	s3        *s3.Client
 	v2Signer  bool
 	gcs       bool
-	sseType   string
+	sseType   types.ServerSideEncryption
 	rootAttrs InodeAttributes
 
 	bufferPool *BufferPool
@@ -125,7 +123,7 @@ func NewGoofys(ctx context.Context, bucket string, awsConfig *aws.Config, flags 
 	}
 
 	if flags.DebugS3 {
-		awsConfig.LogLevel = aws.LogLevel(aws.LogDebug | aws.LogDebugWithRequestErrors)
+		awsConfig.ClientLogMode = aws.LogRequest | aws.LogResponse
 		s3Log.Level = logrus.DebugLevel
 	}
 
@@ -134,7 +132,6 @@ func NewGoofys(ctx context.Context, bucket string, awsConfig *aws.Config, flags 
 	}
 
 	fs.awsConfig = awsConfig
-	fs.sess = session.New(awsConfig)
 	fs.s3 = fs.newS3()
 
 	var isAws bool
@@ -144,7 +141,6 @@ func NewGoofys(ctx context.Context, bucket string, awsConfig *aws.Config, flags 
 		if err == nil {
 			// we detected a region header, this is probably AWS S3,
 			// or we can use anonymous access, or both
-			fs.sess = session.New(awsConfig)
 			fs.s3 = fs.newS3()
 		} else if err == fuse.ENOENT {
 			log.Errorf("bucket %v does not exist", fs.bucket)
@@ -159,7 +155,7 @@ func NewGoofys(ctx context.Context, bucket string, awsConfig *aws.Config, flags 
 	}
 
 	// try again with the credential to make sure
-	err = mapAwsError(fs.testBucket())
+	err = mapAwsError(fs.testBucket(ctx))
 	if err != nil {
 		if !isAws {
 			// EMC returns 403 because it doesn't support v4 signing
@@ -167,7 +163,7 @@ func NewGoofys(ctx context.Context, bucket string, awsConfig *aws.Config, flags 
 			// Amplidata just gives up and return 500
 			if err == syscall.EACCES || err == fuse.EINVAL || err == syscall.EAGAIN {
 				fs.fallbackV2Signer()
-				err = mapAwsError(fs.testBucket())
+				err = mapAwsError(fs.testBucket(ctx))
 			}
 		}
 
@@ -181,10 +177,10 @@ func NewGoofys(ctx context.Context, bucket string, awsConfig *aws.Config, flags 
 
 	if flags.UseKMS {
 		//SSE header string for KMS server-side encryption (SSE-KMS)
-		fs.sseType = s3.ServerSideEncryptionAwsKms
+		fs.sseType = types.ServerSideEncryptionAwsKms
 	} else if flags.UseSSE {
 		//SSE header string for non-KMS server-side encryption (SSE-S3)
-		fs.sseType = s3.ServerSideEncryptionAes256
+		fs.sseType = types.ServerSideEncryptionAes256
 	}
 
 	now := time.Now()
@@ -226,25 +222,39 @@ func (fs *Goofys) fallbackV2Signer() (err error) {
 	return
 }
 
-func addAcceptEncoding(req *request.Request) {
-	if req.HTTPRequest.Method == "GET" {
-		// we need "Accept-Encoding: identity" so that objects
-		// with content-encoding won't be automatically
-		// deflated, but we don't want to sign it because GCS
-		// doesn't like it
-		req.HTTPRequest.Header.Set("Accept-Encoding", "identity")
-	}
+// addAcceptEncodingMiddleware adds Accept-Encoding: identity on GET requests.
+// We need this so that objects with content-encoding won't be automatically
+// deflated, but we don't sign it because GCS doesn't like it.
+func addAcceptEncodingMiddleware(stack *middleware.Stack) error {
+	return stack.Finalize.Add(middleware.FinalizeMiddlewareFunc(
+		"goofys/AcceptEncodingIdentity",
+		func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
+			if req, ok := in.Request.(*smithyhttp.Request); ok {
+				if req.Method == "GET" {
+					req.Header.Set("Accept-Encoding", "identity")
+				}
+			}
+			return next.HandleFinalize(ctx, in)
+		},
+	), middleware.After)
 }
 
-func (fs *Goofys) newS3() *s3.S3 {
-	svc := s3.New(fs.sess)
-	if fs.v2Signer {
-		svc.Handlers.Sign.Clear()
-		svc.Handlers.Sign.PushBack(SignV2)
-		svc.Handlers.Sign.PushBackNamed(corehandlers.BuildContentLengthHandler)
+func (fs *Goofys) newS3() *s3.Client {
+	optFns := []func(*s3.Options){
+		func(o *s3.Options) {
+			o.UsePathStyle = true
+			if fs.awsConfig.BaseEndpoint != nil {
+				o.BaseEndpoint = fs.awsConfig.BaseEndpoint
+			}
+			o.APIOptions = append(o.APIOptions, addAcceptEncodingMiddleware)
+		},
 	}
-	svc.Handlers.Sign.PushBack(addAcceptEncoding)
-	return svc
+	if fs.v2Signer {
+		optFns = append(optFns, func(o *s3.Options) {
+			o.APIOptions = append(o.APIOptions, makeSignV2Middleware(fs.awsConfig))
+		})
+	}
+	return s3.NewFromConfig(*fs.awsConfig, optFns...)
 }
 
 // from https://stackoverflow.com/questions/22892120/how-to-generate-a-random-string-of-a-fixed-length-in-golang
@@ -273,10 +283,10 @@ func RandStringBytesMaskImprSrc(n int) string {
 	return string(b)
 }
 
-func (fs *Goofys) testBucket() (err error) {
+func (fs *Goofys) testBucket(ctx context.Context) (err error) {
 	randomObjectName := fs.key(RandStringBytesMaskImprSrc(32))
 
-	_, err = fs.s3.HeadObject(&s3.HeadObjectInput{Bucket: &fs.bucket, Key: randomObjectName})
+	_, err = fs.s3.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &fs.bucket, Key: randomObjectName})
 	if err != nil {
 		err = mapAwsError(err)
 		if err == fuse.ENOENT {
@@ -294,8 +304,8 @@ func (fs *Goofys) detectBucketLocationByHEAD() (err error, isAws bool) {
 		Path:   fs.bucket,
 	}
 
-	if fs.awsConfig.Endpoint != nil {
-		endpoint, err := url.Parse(*fs.awsConfig.Endpoint)
+	if fs.awsConfig.BaseEndpoint != nil {
+		endpoint, err := url.Parse(*fs.awsConfig.BaseEndpoint)
 		if err != nil {
 			return err, false
 		}
@@ -344,7 +354,7 @@ func (fs *Goofys) detectBucketLocationByHEAD() (err error, isAws bool) {
 	case 200:
 		// note that this only happen if the bucket is in us-east-1
 		if len(fs.flags.Profile) == 0 {
-			fs.awsConfig.Credentials = credentials.AnonymousCredentials
+			fs.awsConfig.Credentials = aws.AnonymousCredentials{}
 			s3Log.Infof("anonymous bucket detected")
 		}
 	case 400:
@@ -356,14 +366,14 @@ func (fs *Goofys) detectBucketLocationByHEAD() (err error, isAws bool) {
 	case 405:
 		err = syscall.ENOTSUP
 	default:
-		err = awserr.New(strconv.Itoa(resp.StatusCode), resp.Status, nil)
+		err = fmt.Errorf("%v %v", resp.StatusCode, resp.Status)
 	}
 
 	if len(region) != 0 {
-		if region[0] != *fs.awsConfig.Region {
+		if region[0] != fs.awsConfig.Region {
 			s3Log.Infof("Switching from region '%v' to '%v'",
-				*fs.awsConfig.Region, region[0])
-			fs.awsConfig.Region = &region[0]
+				fs.awsConfig.Region, region[0])
+			fs.awsConfig.Region = region[0]
 		}
 
 		// we detected a region, this is aws, the error is irrelevant
@@ -374,7 +384,8 @@ func (fs *Goofys) detectBucketLocationByHEAD() (err error, isAws bool) {
 }
 
 func (fs *Goofys) cleanUpOldMPU() {
-	mpu, err := fs.s3.ListMultipartUploads(&s3.ListMultipartUploadsInput{Bucket: &fs.bucket})
+	ctx := context.Background()
+	mpu, err := fs.s3.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{Bucket: &fs.bucket})
 	if err != nil {
 		mapAwsError(err)
 		return
@@ -391,7 +402,7 @@ func (fs *Goofys) cleanUpOldMPU() {
 				Key:      upload.Key,
 				UploadId: upload.UploadId,
 			}
-			resp, err := fs.s3.AbortMultipartUpload(params)
+			resp, err := fs.s3.AbortMultipartUpload(ctx, params)
 			s3Log.Debug(resp)
 
 			if mapAwsError(err) == syscall.EACCES {
@@ -536,38 +547,38 @@ func mapAwsError(err error) error {
 		return nil
 	}
 
-	if awsErr, ok := err.(awserr.Error); ok {
-		if reqErr, ok := err.(awserr.RequestFailure); ok {
-			// A service error occurred
-			switch reqErr.StatusCode() {
-			case 400:
-				return fuse.EINVAL
-			case 403:
-				return syscall.EACCES
-			case 404:
-				return fuse.ENOENT
-			case 405:
-				return syscall.ENOTSUP
-			case 500:
-				return syscall.EAGAIN
-			default:
-				s3Log.Errorf("code=%v msg=%v request=%v\n", reqErr.Message(), reqErr.StatusCode(), reqErr.RequestID())
-				return reqErr
-			}
-		} else {
-			switch awsErr.Code() {
-			case "BucketRegionError":
-				// don't need to log anything, we should detect region after
-				return err
-			default:
-				// Generic AWS Error with Code, Message, and original error (if any)
-				s3Log.Errorf("code=%v msg=%v, err=%v\n", awsErr.Code(), awsErr.Message(), awsErr.OrigErr())
-				return awsErr
-			}
+	var re *smithyhttp.ResponseError
+	if errors.As(err, &re) {
+		switch re.HTTPStatusCode() {
+		case 400:
+			return fuse.EINVAL
+		case 403:
+			return syscall.EACCES
+		case 404:
+			return fuse.ENOENT
+		case 405:
+			return syscall.ENOTSUP
+		case 500:
+			return syscall.EAGAIN
+		default:
+			s3Log.Errorf("http=%v err=%v\n", re.HTTPStatusCode(), re.Error())
+			return re
 		}
-	} else {
-		return err
 	}
+
+	var ae smithy.APIError
+	if errors.As(err, &ae) {
+		switch ae.ErrorCode() {
+		case "BucketRegionError":
+			// don't need to log anything, we should detect region after
+			return err
+		default:
+			s3Log.Errorf("code=%v msg=%v\n", ae.ErrorCode(), ae.ErrorMessage())
+			return ae
+		}
+	}
+
+	return err
 }
 
 func (fs *Goofys) key(name string) *string {
@@ -633,7 +644,7 @@ func (fs *Goofys) LookUpInode(
 	if !ok {
 		var newInode *Inode
 
-		newInode, err = parent.LookUp(op.Name)
+		newInode, err = parent.LookUp(ctx, op.Name)
 		if err != nil {
 			if inode != nil {
 				// just kidding! pretend we didn't up the ref
@@ -997,7 +1008,7 @@ func (fs *Goofys) MkDir(
 	fs.mu.Unlock()
 
 	// ignore op.Mode for now
-	inode, err := parent.MkDir(op.Name)
+	inode, err := parent.MkDir(ctx, op.Name)
 	if err != nil {
 		return err
 	}
@@ -1023,7 +1034,7 @@ func (fs *Goofys) RmDir(
 	parent := fs.getInodeOrDie(op.Parent)
 	fs.mu.Unlock()
 
-	err = parent.RmDir(op.Name)
+	err = parent.RmDir(ctx, op.Name)
 	parent.logFuse("<-- RmDir", op.Name, err)
 	return
 }
@@ -1069,7 +1080,7 @@ func (fs *Goofys) Unlink(
 	parent := fs.getInodeOrDie(op.Parent)
 	fs.mu.Unlock()
 
-	err = parent.Unlink(op.Name)
+	err = parent.Unlink(ctx, op.Name)
 	return
 }
 
@@ -1099,7 +1110,7 @@ func (fs *Goofys) Rename(
 		defer newParent.mu.Unlock()
 	}
 
-	err = parent.Rename(op.OldName, newParent, op.NewName)
+	err = parent.Rename(ctx, op.OldName, newParent, op.NewName)
 	if err != nil {
 		if err == fuse.ENOENT {
 			// if the source doesn't exist, it could be

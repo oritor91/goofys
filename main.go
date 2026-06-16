@@ -152,7 +152,7 @@ func main() {
 
 	app.Action = func(c *cli.Context) (err error) {
 		// We should get two arguments exactly. Otherwise error out.
-		if c.Args().Len() != 2 {
+		if len(c.Args()) != 2 {
 			fmt.Fprintf(
 				os.Stderr,
 				"Error: %s takes exactly two arguments.\n\n",

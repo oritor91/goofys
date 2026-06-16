@@ -15,15 +15,19 @@
 package internal
 
 import (
+	"context"
 	"fmt"
 	glog "log"
 	"log/syslog"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/kdar/logrus-cloudwatchlogs"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
+	"github.com/aws/smithy-go/logging"
 	"github.com/sirupsen/logrus"
 	logrus_syslog "github.com/sirupsen/logrus/hooks/syslog"
 )
@@ -38,14 +42,15 @@ var syslogHook *logrus_syslog.SyslogHook
 
 func InitLoggers(logToSyslog bool, cwRegion, cwGroup, cwName string) {
 	if cwRegion != "" && cwGroup != "" && cwName != "" {
-		cfg := aws.NewConfig().WithRegion(cwRegion)
-		hook, err := logrus_cloudwatchlogs.NewHook(cwGroup, cwName, cfg)
+		hook, err := newCloudWatchLogsHook(cwRegion, cwGroup, cwName)
 		if err != nil {
 			log.Println(fmt.Sprintf("Could not create cloudwatch log: %s", err.Error()))
 		} else {
+			mu.Lock()
 			for _, l := range loggers {
 				l.Hooks.Add(hook)
 			}
+			mu.Unlock()
 		}
 	}
 
@@ -54,9 +59,11 @@ func InitLoggers(logToSyslog bool, cwRegion, cwGroup, cwName string) {
 		if err != nil {
 			log.Println(fmt.Sprintf("Unable to connect to local syslog daemon: %s", err.Error()))
 		} else {
+			mu.Lock()
 			for _, l := range loggers {
 				l.Hooks.Add(hook)
 			}
+			mu.Unlock()
 		}
 	}
 }
@@ -96,9 +103,14 @@ func (l *LogHandle) Format(e *logrus.Entry) ([]byte, error) {
 	return []byte(str), nil
 }
 
-// for aws.Logger
+// Log implements aws.Logger (v1 compat, not needed for v2 but harmless)
 func (l *LogHandle) Log(args ...interface{}) {
 	l.Debugln(args...)
+}
+
+// Logf implements logging.Logger for AWS SDK v2
+func (l *LogHandle) Logf(classification logging.Classification, format string, v ...interface{}) {
+	l.Debugf(format, v...)
 }
 
 func NewLogger(name string) *LogHandle {
@@ -134,4 +146,140 @@ func GetStdLogger(l *LogHandle, lvl logrus.Level) *glog.Logger {
 	l.Formatter.(*LogHandle).Lvl = &lvl
 	l.Level = lvl
 	return glog.New(w, "", 0)
+}
+
+// cloudWatchLogsHook is an internal logrus hook that ships log lines to CloudWatch Logs.
+type cloudWatchLogsHook struct {
+	svc               *cloudwatchlogs.Client
+	groupName         string
+	streamName        string
+	nextSequenceToken *string
+	m                 sync.Mutex
+	ch                chan *cwltypes.InputLogEvent
+}
+
+func newCloudWatchLogsHook(region, groupName, streamName string) (*cloudWatchLogsHook, error) {
+	cfg := aws.Config{Region: region}
+	svc := cloudwatchlogs.NewFromConfig(cfg)
+	h := &cloudWatchLogsHook{
+		svc:        svc,
+		groupName:  groupName,
+		streamName: streamName,
+		ch:         make(chan *cwltypes.InputLogEvent, 10000),
+	}
+
+	// ensure log group + stream exist
+	if err := h.ensureGroupAndStream(); err != nil {
+		return nil, err
+	}
+
+	go h.putBatches(time.NewTicker(5 * time.Second).C)
+	return h, nil
+}
+
+func (h *cloudWatchLogsHook) ensureGroupAndStream() error {
+	ctx := context.Background()
+
+	resp, err := h.svc.DescribeLogStreams(ctx, &cloudwatchlogs.DescribeLogStreamsInput{
+		LogGroupName:        aws.String(h.groupName),
+		LogStreamNamePrefix: aws.String(h.streamName),
+	})
+	if err != nil {
+		// try creating the group first
+		_, cerr := h.svc.CreateLogGroup(ctx, &cloudwatchlogs.CreateLogGroupInput{
+			LogGroupName: aws.String(h.groupName),
+		})
+		if cerr != nil {
+			return cerr
+		}
+		resp, err = h.svc.DescribeLogStreams(ctx, &cloudwatchlogs.DescribeLogStreamsInput{
+			LogGroupName:        aws.String(h.groupName),
+			LogStreamNamePrefix: aws.String(h.streamName),
+		})
+		if err != nil {
+			return err
+		}
+	}
+
+	if len(resp.LogStreams) > 0 {
+		h.nextSequenceToken = resp.LogStreams[0].UploadSequenceToken
+		return nil
+	}
+
+	_, err = h.svc.CreateLogStream(ctx, &cloudwatchlogs.CreateLogStreamInput{
+		LogGroupName:  aws.String(h.groupName),
+		LogStreamName: aws.String(h.streamName),
+	})
+	return err
+}
+
+func (h *cloudWatchLogsHook) putBatches(ticker <-chan time.Time) {
+	var batch []*cwltypes.InputLogEvent
+	size := 0
+	for {
+		select {
+		case p := <-h.ch:
+			messageSize := len(*p.Message) + 26
+			if size+messageSize >= 1048576 || len(batch) == 10000 {
+				go h.sendBatch(batch)
+				batch = nil
+				size = 0
+			}
+			batch = append(batch, p)
+			size += messageSize
+		case <-ticker:
+			go h.sendBatch(batch)
+			batch = nil
+			size = 0
+		}
+	}
+}
+
+func (h *cloudWatchLogsHook) sendBatch(batch []*cwltypes.InputLogEvent) {
+	h.m.Lock()
+	defer h.m.Unlock()
+
+	if len(batch) == 0 {
+		return
+	}
+
+	events := make([]cwltypes.InputLogEvent, len(batch))
+	for i, e := range batch {
+		events[i] = *e
+	}
+
+	params := &cloudwatchlogs.PutLogEventsInput{
+		LogEvents:     events,
+		LogGroupName:  aws.String(h.groupName),
+		LogStreamName: aws.String(h.streamName),
+		SequenceToken: h.nextSequenceToken,
+	}
+	resp, err := h.svc.PutLogEvents(context.Background(), params)
+	if err == nil {
+		h.nextSequenceToken = resp.NextSequenceToken
+	}
+}
+
+func (h *cloudWatchLogsHook) Fire(entry *logrus.Entry) error {
+	line, err := entry.String()
+	if err != nil {
+		return err
+	}
+	ts := entry.Time.UnixNano() / int64(time.Millisecond)
+	h.ch <- &cwltypes.InputLogEvent{
+		Message:   aws.String(line),
+		Timestamp: aws.Int64(ts),
+	}
+	return nil
+}
+
+func (h *cloudWatchLogsHook) Levels() []logrus.Level {
+	return []logrus.Level{
+		logrus.PanicLevel,
+		logrus.FatalLevel,
+		logrus.ErrorLevel,
+		logrus.WarnLevel,
+		logrus.InfoLevel,
+		logrus.DebugLevel,
+	}
 }
