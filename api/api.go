@@ -112,9 +112,12 @@ func Mount(
 
 	if config.AccessKey != "" {
 		awsConfig.Credentials = credentials.NewStaticCredentialsProvider(config.AccessKey, config.SecretKey, "")
-	} else if len(flags.Profile) > 0 {
-		c, err := awsconfig.LoadDefaultConfig(ctx,
-			awsconfig.WithSharedConfigProfile(flags.Profile))
+	} else {
+		loadOpts := []func(*awsconfig.LoadOptions) error{}
+		if len(flags.Profile) > 0 {
+			loadOpts = append(loadOpts, awsconfig.WithSharedConfigProfile(flags.Profile))
+		}
+		c, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 		if err == nil {
 			awsConfig.Credentials = c.Credentials
 		}
