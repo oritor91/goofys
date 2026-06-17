@@ -36,13 +36,10 @@ import (
 
 	"golang.org/x/net/context"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/corehandlers"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-
-	"github.com/kahing/go-xattr"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseops"
@@ -55,6 +52,9 @@ import (
 
 // so I don't get complains about unused imports
 var ignored = logrus.DebugLevel
+
+// suppress unused import
+var _ = types.StorageClass("")
 
 func currentUid() uint32 {
 	user, err := user.Current()
@@ -87,9 +87,8 @@ func currentGid() uint32 {
 type GoofysTest struct {
 	fs        *Goofys
 	ctx       context.Context
-	awsConfig *aws.Config
-	s3        *s3.S3
-	sess      *session.Session
+	awsConfig aws.Config
+	s3        *s3.Client
 	env       map[string]io.ReadSeeker
 }
 
@@ -125,30 +124,24 @@ func waitFor(t *C, addr string) (err error) {
 	return
 }
 
-func selectTestConfig(t *C) *aws.Config {
+func selectTestConfig(t *C) aws.Config {
 	if hasEnv("AWS") {
-		return &aws.Config{
-			Region:     aws.String("us-west-2"),
-			DisableSSL: aws.Bool(true),
-			//LogLevel:         aws.LogLevel(aws.LogDebug | aws.LogDebugWithSigning),
-			S3ForcePathStyle: aws.Bool(true),
+		return aws.Config{
+			Region: "us-west-2",
 		}
 	} else if hasEnv("GCS") {
-		return &aws.Config{
-			Region:      aws.String("us-west1"),
-			Endpoint:    aws.String("http://storage.googleapis.com"),
-			Credentials: credentials.NewSharedCredentials("", os.Getenv("GCS")),
-			//LogLevel:         aws.LogLevel(aws.LogDebug | aws.LogDebugWithSigning),
-			S3ForcePathStyle: aws.Bool(true),
+		endpoint := "http://storage.googleapis.com"
+		return aws.Config{
+			Region:       "us-west1",
+			BaseEndpoint: &endpoint,
+			Credentials:  credentials.NewStaticCredentialsProvider("", os.Getenv("GCS"), ""),
 		}
 	} else if hasEnv("MINIO") {
-		return &aws.Config{
-			Credentials: credentials.NewStaticCredentials("Q3AM3UQ867SPQQA43P2F",
-				"zuf+tfteSlswRu7BJ86wekitnifILbZam1KYY3TG", ""),
-			Region: aws.String("us-east-1"),
-			//LogLevel:         aws.LogLevel(aws.LogDebug | aws.LogDebugWithSigning),
-			S3ForcePathStyle: aws.Bool(true),
-			Endpoint:         aws.String("https://play.minio.io:9000"),
+		endpoint := "https://play.minio.io:9000"
+		return aws.Config{
+			Credentials:  credentials.NewStaticCredentialsProvider("Q3AM3UQ867SPQQA43P2F", "zuf+tfteSlswRu7BJ86wekitnifILbZam1KYY3TG", ""),
+			Region:       "us-east-1",
+			BaseEndpoint: &endpoint,
 		}
 	} else {
 		addr := "127.0.0.1:8080"
@@ -156,17 +149,11 @@ func selectTestConfig(t *C) *aws.Config {
 		err := waitFor(t, addr)
 		t.Assert(err, IsNil)
 
-		return &aws.Config{
-			//Credentials: credentials.AnonymousCredentials,
-			Credentials:      credentials.NewStaticCredentials("foo", "bar", ""),
-			Region:           aws.String("us-west-2"),
-			Endpoint:         aws.String("http://" + addr),
-			DisableSSL:       aws.Bool(true),
-			S3ForcePathStyle: aws.Bool(true),
-			MaxRetries:       aws.Int(0),
-			//Logger: t,
-			//LogLevel: aws.LogLevel(aws.LogDebug),
-			//LogLevel: aws.LogLevel(aws.LogDebug | aws.LogDebugWithHTTPBody),
+		endpoint := "http://" + addr
+		return aws.Config{
+			Credentials:  credentials.NewStaticCredentialsProvider("foo", "bar", ""),
+			Region:       "us-west-2",
+			BaseEndpoint: &endpoint,
 		}
 	}
 }
@@ -175,7 +162,7 @@ func (s *GoofysTest) SetUpSuite(t *C) {
 }
 
 func (s *GoofysTest) deleteBucket(t *C) {
-	resp, err := s.s3.ListObjects(&s3.ListObjectsInput{Bucket: &s.fs.bucket})
+	resp, err := s.s3.ListObjects(context.Background(), &s3.ListObjectsInput{Bucket: &s.fs.bucket})
 	t.Assert(err, IsNil)
 
 	if hasEnv("GCS") {
@@ -184,9 +171,9 @@ func (s *GoofysTest) deleteBucket(t *C) {
 
 		for _, o := range resp.Contents {
 			wg.Add(1)
-			key := *o.Key
+			key := aws.ToString(o.Key)
 			go func() {
-				_, err = s.s3.DeleteObject(&s3.DeleteObjectInput{
+				_, err = s.s3.DeleteObject(context.Background(), &s3.DeleteObjectInput{
 					Bucket: &s.fs.bucket,
 					Key:    &key,
 				})
@@ -198,20 +185,20 @@ func (s *GoofysTest) deleteBucket(t *C) {
 	} else {
 		num_objs := len(resp.Contents)
 
-		var items s3.Delete
-		var objs = make([]*s3.ObjectIdentifier, num_objs)
+		objs := make([]types.ObjectIdentifier, num_objs)
 
 		for i, o := range resp.Contents {
-			objs[i] = &s3.ObjectIdentifier{Key: aws.String(*o.Key)}
+			objs[i] = types.ObjectIdentifier{Key: o.Key}
 		}
 
-		// Add list of objects to delete to Delete object
-		items.SetObjects(objs)
-		_, err = s.s3.DeleteObjects(&s3.DeleteObjectsInput{Bucket: &s.fs.bucket, Delete: &items})
+		_, err = s.s3.DeleteObjects(context.Background(), &s3.DeleteObjectsInput{
+			Bucket: &s.fs.bucket,
+			Delete: &types.Delete{Objects: objs},
+		})
 		t.Assert(err, IsNil)
 	}
 
-	s.s3.DeleteBucket(&s3.DeleteBucketInput{Bucket: &s.fs.bucket})
+	s.s3.DeleteBucket(context.Background(), &s3.DeleteBucketInput{Bucket: &s.fs.bucket})
 }
 
 func (s *GoofysTest) TearDownSuite(t *C) {
@@ -221,12 +208,11 @@ func (s *GoofysTest) TearDownSuite(t *C) {
 func (s *GoofysTest) setupEnv(t *C, bucket string, env map[string]io.ReadSeeker, public bool) {
 	param := s3.CreateBucketInput{
 		Bucket: &bucket,
-		//ACL: aws.String(s3.BucketCannedACLPrivate),
 	}
 	if public {
-		param.ACL = aws.String("public-read")
+		param.ACL = types.BucketCannedACLPublicRead
 	}
-	_, err := s.s3.CreateBucket(&param)
+	_, err := s.s3.CreateBucket(context.Background(), &param)
 	t.Assert(err, IsNil)
 
 	for path, r := range env {
@@ -242,19 +228,19 @@ func (s *GoofysTest) setupEnv(t *C, bucket string, env map[string]io.ReadSeeker,
 			Bucket: &bucket,
 			Key:    &path,
 			Body:   r,
-			Metadata: map[string]*string{
-				"name": aws.String(path + "+/#%00"),
+			Metadata: map[string]string{
+				"name": path + "+/#%00",
 			},
 		}
 
-		_, err := s.s3.PutObject(params)
+		_, err := s.s3.PutObject(context.Background(), params)
 		t.Assert(err, IsNil)
 	}
 
 	// double check
 	for path := range env {
 		params := &s3.HeadObjectInput{Bucket: &bucket, Key: &path}
-		_, err := s.s3.HeadObject(params)
+		_, err := s.s3.HeadObject(context.Background(), params)
 		t.Assert(err, IsNil)
 	}
 
@@ -282,16 +268,11 @@ func (s *GoofysTest) setupDefaultEnv(t *C, public bool) (bucket string) {
 
 func (s *GoofysTest) SetUpTest(t *C) {
 	s.awsConfig = selectTestConfig(t)
-	s.sess = session.New(s.awsConfig)
-	s.s3 = s3.New(s.sess)
+	s.s3 = s3.NewFromConfig(s.awsConfig, func(o *s3.Options) {
+		o.UsePathStyle = true
+	})
 
-	if !hasEnv("MINIO") {
-		s.s3.Handlers.Sign.Clear()
-		s.s3.Handlers.Sign.PushBack(SignV2)
-		s.s3.Handlers.Sign.PushBackNamed(corehandlers.BuildContentLengthHandler)
-	}
-
-	_, err := s.s3.ListBuckets(nil)
+	_, err := s.s3.ListBuckets(context.Background(), &s3.ListBucketsInput{})
 	t.Assert(err, IsNil)
 
 	bucket := s.setupDefaultEnv(t, false)
@@ -309,7 +290,7 @@ func (s *GoofysTest) SetUpTest(t *C) {
 	if hasEnv("GCS") {
 		flags.Endpoint = "http://storage.googleapis.com"
 	}
-	s.fs = NewGoofys(context.Background(), bucket, s.awsConfig, flags)
+	s.fs = NewGoofys(context.Background(), bucket, &s.awsConfig, flags)
 	t.Assert(s.fs, NotNil)
 }
 
@@ -351,7 +332,7 @@ func (s *GoofysTest) LookUpInode(t *C, name string) (in *Inode, err error) {
 			Name:   dirName,
 		}
 
-		err = s.fs.LookUpInode(nil, &lookup)
+		err = s.fs.LookUpInode(s.ctx, &lookup)
 		if err != nil {
 			return
 		}
@@ -363,7 +344,7 @@ func (s *GoofysTest) LookUpInode(t *C, name string) (in *Inode, err error) {
 		Name:   name,
 	}
 
-	err = s.fs.LookUpInode(nil, &lookup)
+	err = s.fs.LookUpInode(s.ctx, &lookup)
 	if err != nil {
 		return
 	}
@@ -392,7 +373,7 @@ func (s *GoofysTest) TestLookUpInode(t *C) {
 }
 
 func (s *GoofysTest) TestGetInodeAttributes(t *C) {
-	inode, err := s.getRoot(t).LookUp("file1")
+	inode, err := s.getRoot(t).LookUp(s.ctx, "file1")
 	t.Assert(err, IsNil)
 
 	attr, err := inode.GetAttributes()
@@ -442,7 +423,7 @@ func (s *GoofysTest) assertEntries(t *C, in *Inode, names []string) {
 
 func (s *GoofysTest) readDirIntoCache(t *C, inode fuseops.InodeID) {
 	openDirOp := fuseops.OpenDirOp{Inode: inode}
-	err := s.fs.OpenDir(nil, &openDirOp)
+	err := s.fs.OpenDir(s.ctx, &openDirOp)
 	t.Assert(err, IsNil)
 
 	readDirOp := fuseops.ReadDirOp{
@@ -451,7 +432,7 @@ func (s *GoofysTest) readDirIntoCache(t *C, inode fuseops.InodeID) {
 		Dst:    make([]byte, 8*1024),
 	}
 
-	err = s.fs.ReadDir(nil, &readDirOp)
+	err = s.fs.ReadDir(s.ctx, &readDirOp)
 	t.Assert(err, IsNil)
 }
 
@@ -465,7 +446,7 @@ func (s *GoofysTest) TestReadDirCacheLookup(t *C) {
 	// should be cached so lookup should not need to talk to s3
 	entries := []string{"dir1", "dir2", "dir4", "empty_dir", "empty_dir2", "file1", "file2", "zero"}
 	for _, en := range entries {
-		err := s.fs.LookUpInode(nil, &fuseops.LookUpInodeOp{
+		err := s.fs.LookUpInode(s.ctx, &fuseops.LookUpInodeOp{
 			Parent: fuseops.RootInodeID,
 			Name:   en,
 		})
@@ -491,7 +472,7 @@ func (s *GoofysTest) TestReadDir(t *C) {
 	s.assertEntries(t, in, []string{"dir3"})
 
 	// test listing dir2/dir3/
-	in, err = in.LookUp("dir3")
+	in, err = in.LookUp(s.ctx, "dir3")
 	t.Assert(err, IsNil)
 	s.assertEntries(t, in, []string{"file4"})
 }
@@ -518,7 +499,7 @@ func (s *GoofysTest) TestReadFiles(t *C) {
 
 	for _, en := range entries {
 		if en.Type == fuseutil.DT_File {
-			in, err := parent.LookUp(*en.Name)
+			in, err := parent.LookUp(s.ctx, *en.Name)
 			t.Assert(err, IsNil)
 
 			fh, err := in.OpenFile()
@@ -544,7 +525,7 @@ func (s *GoofysTest) TestReadOffset(t *C) {
 	root := s.getRoot(t)
 	f := "file1"
 
-	in, err := root.LookUp(f)
+	in, err := root.LookUp(s.ctx, f)
 	t.Assert(err, IsNil)
 
 	fh, err := in.OpenFile()
@@ -576,18 +557,18 @@ func (s *GoofysTest) TestCreateFiles(t *C) {
 	err := fh.FlushFile()
 	t.Assert(err, IsNil)
 
-	resp, err := s.s3.GetObject(&s3.GetObjectInput{Bucket: &s.fs.bucket, Key: &fileName})
+	resp, err := s.s3.GetObject(context.Background(), &s3.GetObjectInput{Bucket: &s.fs.bucket, Key: &fileName})
 	t.Assert(err, IsNil)
-	t.Assert(*resp.ContentLength, DeepEquals, int64(0))
+	t.Assert(aws.ToInt64(resp.ContentLength), DeepEquals, int64(0))
 	defer resp.Body.Close()
 
-	_, err = s.getRoot(t).LookUp(fileName)
+	_, err = s.getRoot(t).LookUp(s.ctx, fileName)
 	t.Assert(err, IsNil)
 
 	fileName = "testCreateFile2"
 	s.testWriteFile(t, fileName, 1, 128*1024)
 
-	inode, err := s.getRoot(t).LookUp(fileName)
+	inode, err := s.getRoot(t).LookUp(s.ctx, fileName)
 	t.Assert(err, IsNil)
 
 	fh, err = inode.OpenFile()
@@ -596,20 +577,20 @@ func (s *GoofysTest) TestCreateFiles(t *C) {
 	err = fh.FlushFile()
 	t.Assert(err, IsNil)
 
-	resp, err = s.s3.GetObject(&s3.GetObjectInput{Bucket: &s.fs.bucket, Key: &fileName})
+	resp, err = s.s3.GetObject(context.Background(), &s3.GetObjectInput{Bucket: &s.fs.bucket, Key: &fileName})
 	t.Assert(err, IsNil)
-	t.Assert(*resp.ContentLength, Equals, int64(1))
+	t.Assert(aws.ToInt64(resp.ContentLength), Equals, int64(1))
 	defer resp.Body.Close()
 }
 
 func (s *GoofysTest) TestUnlink(t *C) {
 	fileName := "file1"
 
-	err := s.getRoot(t).Unlink(fileName)
+	err := s.getRoot(t).Unlink(s.ctx, fileName)
 	t.Assert(err, IsNil)
 
 	// make sure that it's gone from s3
-	_, err = s.s3.GetObject(&s3.GetObjectInput{Bucket: &s.fs.bucket, Key: &fileName})
+	_, err = s.s3.GetObject(context.Background(), &s3.GetObjectInput{Bucket: &s.fs.bucket, Key: &fileName})
 	t.Assert(mapAwsError(err), Equals, fuse.ENOENT)
 }
 
@@ -648,7 +629,7 @@ func (s *GoofysTest) testWriteFileAt(t *C, fileName string, offset int64, size i
 	if offset == 0 {
 		_, fh = s.getRoot(t).Create(fileName)
 	} else {
-		in, err := s.getRoot(t).LookUp(fileName)
+		in, err := s.getRoot(t).LookUp(s.ctx, fileName)
 		t.Assert(err, IsNil)
 
 		fh, err = in.OpenFile()
@@ -676,9 +657,9 @@ func (s *GoofysTest) testWriteFileAt(t *C, fileName string, offset int64, size i
 	err := fh.FlushFile()
 	t.Assert(err, IsNil)
 
-	resp, err := s.s3.HeadObject(&s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: &fileName})
+	resp, err := s.s3.HeadObject(context.Background(), &s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: &fileName})
 	t.Assert(err, IsNil)
-	t.Assert(*resp.ContentLength, DeepEquals, size+offset)
+	t.Assert(aws.ToInt64(resp.ContentLength), DeepEquals, size+offset)
 
 	fr := &FileHandleReader{s.fs, fh, offset}
 	diff, err := CompareReader(fr, io.LimitReader(&SeqReader{offset}, size))
@@ -755,7 +736,7 @@ func (s *GoofysTest) TestMkDir(t *C) {
 	t.Assert(err, Equals, fuse.ENOENT)
 
 	dirName := "new_dir"
-	inode, err := s.getRoot(t).MkDir(dirName)
+	inode, err := s.getRoot(t).MkDir(s.ctx, dirName)
 	t.Assert(err, IsNil)
 	t.Assert(*inode.FullName(), Equals, dirName)
 
@@ -775,13 +756,13 @@ func (s *GoofysTest) TestMkDir(t *C) {
 func (s *GoofysTest) TestRmDir(t *C) {
 	root := s.getRoot(t)
 
-	err := root.RmDir("dir1")
+	err := root.RmDir(s.ctx, "dir1")
 	t.Assert(err, Equals, fuse.ENOTEMPTY)
 
-	err = root.RmDir("dir2")
+	err = root.RmDir(s.ctx, "dir2")
 	t.Assert(err, Equals, fuse.ENOTEMPTY)
 
-	err = root.RmDir("empty_dir")
+	err = root.RmDir(s.ctx, "empty_dir")
 	t.Assert(err, IsNil)
 
 }
@@ -791,25 +772,26 @@ func (s *GoofysTest) TestRenamePreserveMetadata(t *C) {
 
 	from, to := "file1", "new_file"
 
-	metadata := make(map[string]*string)
-	metadata["foo"] = aws.String("bar")
+	metadata := make(map[string]string)
+	metadata["foo"] = "bar"
 
-	_, err := s.s3.CopyObject(&s3.CopyObjectInput{
+	_, err := s.s3.CopyObject(context.Background(), &s3.CopyObjectInput{
 		Bucket:            &s.fs.bucket,
 		CopySource:        aws.String(s.fs.bucket + "/" + from),
 		Key:               &from,
 		Metadata:          metadata,
-		MetadataDirective: aws.String(s3.MetadataDirectiveReplace),
+		MetadataDirective: types.MetadataDirectiveReplace,
 	})
 	t.Assert(err, IsNil)
 
-	err = root.Rename(from, root, to)
+	err = root.Rename(s.ctx, from, root, to)
 	t.Assert(err, IsNil)
 
-	resp, err := s.s3.HeadObject(&s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: &to})
+	resp, err := s.s3.HeadObject(context.Background(), &s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: &to})
 	t.Assert(err, IsNil)
-	t.Assert(resp.Metadata["Foo"], NotNil)
-	t.Assert(*resp.Metadata["Foo"], Equals, "bar")
+	v, ok := resp.Metadata["foo"]
+	t.Assert(ok, Equals, true)
+	t.Assert(v, Equals, "bar")
 }
 
 func (s *GoofysTest) TestRenameLarge(t *C) {
@@ -818,7 +800,7 @@ func (s *GoofysTest) TestRenameLarge(t *C) {
 	root := s.getRoot(t)
 
 	from, to := "large_file", "large_file2"
-	err := root.Rename(from, root, to)
+	err := root.Rename(s.ctx, from, root, to)
 	t.Assert(err, IsNil)
 }
 
@@ -832,7 +814,7 @@ func (s *GoofysTest) TestRenameToExisting(t *C) {
 	_, err = s.LookUpInode(t, "file2")
 	t.Assert(err, IsNil)
 
-	err = s.fs.Rename(nil, &fuseops.RenameOp{
+	err = s.fs.Rename(s.ctx, &fuseops.RenameOp{
 		OldParent: root.Id,
 		NewParent: root.Id,
 		OldName:   "file1",
@@ -851,61 +833,61 @@ func (s *GoofysTest) TestRenameToExisting(t *C) {
 func (s *GoofysTest) TestRename(t *C) {
 	root := s.getRoot(t)
 	from, to := "dir1", "new_dir"
-	err := root.Rename(from, root, to)
+	err := root.Rename(s.ctx, from, root, to)
 	t.Assert(err, Equals, fuse.ENOTEMPTY)
 
-	dir2, err := root.LookUp("dir2")
+	dir2, err := root.LookUp(s.ctx, "dir2")
 	t.Assert(err, IsNil)
 
 	from, to = "dir3", "new_dir"
-	err = dir2.Rename(from, root, to)
+	err = dir2.Rename(s.ctx, from, root, to)
 	t.Assert(err, Equals, fuse.ENOTEMPTY)
 
 	from, to = "empty_dir", "dir1"
-	err = root.Rename(from, root, to)
+	err = root.Rename(s.ctx, from, root, to)
 	t.Assert(err, Equals, fuse.ENOTEMPTY)
 
 	from, to = "empty_dir", "file1"
-	err = root.Rename(from, root, to)
+	err = root.Rename(s.ctx, from, root, to)
 	t.Assert(err, Equals, fuse.ENOTDIR)
 
 	from, to = "file1", "empty_dir"
-	err = root.Rename(from, root, to)
+	err = root.Rename(s.ctx, from, root, to)
 	t.Assert(err, Equals, syscall.EISDIR)
 
 	from, to = "empty_dir", "new_dir"
-	err = root.Rename(from, root, to)
+	err = root.Rename(s.ctx, from, root, to)
 	t.Assert(err, IsNil)
 
 	from, to = "file1", "new_file"
-	err = root.Rename(from, root, to)
+	err = root.Rename(s.ctx, from, root, to)
 	t.Assert(err, IsNil)
 
-	_, err = s.s3.HeadObject(&s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: &to})
+	_, err = s.s3.HeadObject(context.Background(), &s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: &to})
 	t.Assert(err, IsNil)
 
-	_, err = s.s3.HeadObject(&s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: &from})
+	_, err = s.s3.HeadObject(context.Background(), &s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: &from})
 	t.Assert(mapAwsError(err), Equals, fuse.ENOENT)
 
 	from, to = "file3", "new_file"
 	dir, _ := s.LookUpInode(t, "dir1")
-	err = dir.Rename(from, root, to)
+	err = dir.Rename(s.ctx, from, root, to)
 	t.Assert(err, IsNil)
 
-	_, err = s.s3.HeadObject(&s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: &to})
+	_, err = s.s3.HeadObject(context.Background(), &s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: &to})
 	t.Assert(err, IsNil)
 
-	_, err = s.s3.HeadObject(&s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: &from})
+	_, err = s.s3.HeadObject(context.Background(), &s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: &from})
 	t.Assert(mapAwsError(err), Equals, fuse.ENOENT)
 
 	from, to = "no_such_file", "new_file"
-	err = root.Rename(from, root, to)
+	err = root.Rename(s.ctx, from, root, to)
 	t.Assert(err, Equals, fuse.ENOENT)
 
 	if !hasEnv("GCS") {
 		// not really rename but can be used by rename
 		from, to = s.fs.bucket+"/file2", "new_file"
-		err = copyObjectMultipart(s.fs, int64(len("file2")), from, to, "", nil, nil)
+		err = copyObjectMultipart(s.ctx, s.fs, int64(len("file2")), from, to, "", nil, nil)
 		t.Assert(err, IsNil)
 	}
 }
@@ -919,7 +901,7 @@ func (s *GoofysTest) TestConcurrentRefDeref(t *C) {
 	}
 
 	for i := 0; i < 20; i++ {
-		err := s.fs.LookUpInode(nil, &lookupOp)
+		err := s.fs.LookUpInode(s.ctx, &lookupOp)
 		t.Assert(err, IsNil)
 
 		var wg sync.WaitGroup
@@ -931,11 +913,11 @@ func (s *GoofysTest) TestConcurrentRefDeref(t *C) {
 			if i%2 == 0 {
 				runtime.Gosched()
 			}
-			s.fs.LookUpInode(nil, &lookupOp)
+			s.fs.LookUpInode(s.ctx, &lookupOp)
 			wg.Done()
 		}()
 		go func() {
-			s.fs.ForgetInode(nil, &fuseops.ForgetInodeOp{
+			s.fs.ForgetInode(s.ctx, &fuseops.ForgetInodeOp{
 				Inode: lookupOp.Entry.Child,
 				N:     1,
 			})
@@ -1152,7 +1134,7 @@ func (s *GoofysTest) TestChmod(t *C) {
 		Name:   "file1",
 	}
 
-	err := s.fs.LookUpInode(nil, &lookupOp)
+	err := s.fs.LookUpInode(s.ctx, &lookupOp)
 	t.Assert(err, IsNil)
 
 	targetMode := os.FileMode(0777)
@@ -1236,44 +1218,44 @@ func (s *GoofysTest) TestPutMimeType(t *C) {
 
 	s.testWriteFile(t, jpg, 0, 0)
 
-	resp, err := s.s3.HeadObject(&s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: &jpg})
+	resp, err := s.s3.HeadObject(context.Background(), &s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: &jpg})
 	t.Assert(err, IsNil)
-	t.Assert(*resp.ContentType, Equals, "image/jpeg")
+	t.Assert(aws.ToString(resp.ContentType), Equals, "image/jpeg")
 
-	err = root.Rename(jpg, root, file)
+	err = root.Rename(s.ctx, jpg, root, file)
 	t.Assert(err, IsNil)
 
-	resp, err = s.s3.HeadObject(&s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: &file})
+	resp, err = s.s3.HeadObject(context.Background(), &s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: &file})
 	t.Assert(err, IsNil)
 	if hasEnv("AWS") {
-		t.Assert(*resp.ContentType, Equals, "binary/octet-stream")
+		t.Assert(aws.ToString(resp.ContentType), Equals, "binary/octet-stream")
 	} else if hasEnv("GCS") {
-		t.Assert(*resp.ContentType, Equals, "application/octet-stream")
+		t.Assert(aws.ToString(resp.ContentType), Equals, "application/octet-stream")
 	} else {
 		// workaround s3proxy https://github.com/andrewgaul/s3proxy/issues/179
-		t.Assert(*resp.ContentType, Equals, "application/unknown")
+		t.Assert(aws.ToString(resp.ContentType), Equals, "application/unknown")
 	}
 
-	err = root.Rename(file, root, jpg2)
+	err = root.Rename(s.ctx, file, root, jpg2)
 	t.Assert(err, IsNil)
 
-	resp, err = s.s3.HeadObject(&s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: &jpg2})
+	resp, err = s.s3.HeadObject(context.Background(), &s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: &jpg2})
 	t.Assert(err, IsNil)
-	t.Assert(*resp.ContentType, Equals, "image/jpeg")
+	t.Assert(aws.ToString(resp.ContentType), Equals, "image/jpeg")
 }
 
 func (s *GoofysTest) TestBucketPrefixSlash(t *C) {
-	s.fs = NewGoofys(context.Background(), s.fs.bucket+":dir2", s.awsConfig, s.fs.flags)
+	s.fs = NewGoofys(context.Background(), s.fs.bucket+":dir2", &s.awsConfig, s.fs.flags)
 	t.Assert(s.fs.prefix, Equals, "dir2/")
 
-	s.fs = NewGoofys(context.Background(), s.fs.bucket+":dir2///", s.awsConfig, s.fs.flags)
+	s.fs = NewGoofys(context.Background(), s.fs.bucket+":dir2///", &s.awsConfig, s.fs.flags)
 	t.Assert(s.fs.prefix, Equals, "dir2/")
 }
 
 func (s *GoofysTest) TestFuseWithPrefix(t *C) {
 	mountPoint := "/tmp/mnt" + s.fs.bucket
 
-	s.fs = NewGoofys(context.Background(), s.fs.bucket+":testprefix", s.awsConfig, s.fs.flags)
+	s.fs = NewGoofys(context.Background(), s.fs.bucket+":testprefix", &s.awsConfig, s.fs.flags)
 
 	s.runFuseTest(t, mountPoint, true, "../test/fuse-test.sh", mountPoint)
 }
@@ -1290,10 +1272,10 @@ func (s *GoofysTest) TestRenameCache(t *C) {
 	lookupOp2 := lookupOp1
 	lookupOp2.Name = "newfile"
 
-	err := s.fs.LookUpInode(nil, &lookupOp1)
+	err := s.fs.LookUpInode(s.ctx, &lookupOp1)
 	t.Assert(err, IsNil)
 
-	err = s.fs.LookUpInode(nil, &lookupOp2)
+	err = s.fs.LookUpInode(s.ctx, &lookupOp2)
 	t.Assert(err, Equals, fuse.ENOENT)
 
 	renameOp := fuseops.RenameOp{
@@ -1303,16 +1285,16 @@ func (s *GoofysTest) TestRenameCache(t *C) {
 		NewName:   "newfile",
 	}
 
-	err = s.fs.Rename(nil, &renameOp)
+	err = s.fs.Rename(s.ctx, &renameOp)
 	t.Assert(err, IsNil)
 
 	lookupOp1.Entry = fuseops.ChildInodeEntry{}
 	lookupOp2.Entry = fuseops.ChildInodeEntry{}
 
-	err = s.fs.LookUpInode(nil, &lookupOp1)
+	err = s.fs.LookUpInode(s.ctx, &lookupOp1)
 	t.Assert(err, Equals, fuse.ENOENT)
 
-	err = s.fs.LookUpInode(nil, &lookupOp2)
+	err = s.fs.LookUpInode(s.ctx, &lookupOp2)
 	t.Assert(err, IsNil)
 }
 
@@ -1322,18 +1304,18 @@ func (s *GoofysTest) anonymous(t *C) {
 
 	bucket := s.setupDefaultEnv(t, true)
 
-	s.fs = NewGoofys(context.Background(), bucket, s.awsConfig, s.fs.flags)
+	s.fs = NewGoofys(context.Background(), bucket, &s.awsConfig, s.fs.flags)
 	t.Assert(s.fs, NotNil)
 
 	// should have auto-detected within NewGoofys, but doing this here to ensure
 	// we are using anonymous credentials
-	s.fs.awsConfig = selectTestConfig(t)
-	s.fs.awsConfig.Credentials = credentials.AnonymousCredentials
-	s.fs.sess = session.New(s.fs.awsConfig)
+	s.awsConfig = selectTestConfig(t)
+	s.fs.awsConfig = &s.awsConfig
+	s.fs.awsConfig.Credentials = aws.AnonymousCredentials{}
 	s.fs.s3 = s.fs.newS3()
 }
 
-func (s *GoofysTest) disableS3() *s3.S3 {
+func (s *GoofysTest) disableS3() *s3.Client {
 	time.Sleep(1 * time.Second) // wait for any background goroutines to finish
 	s3 := s.fs.s3
 	s.fs.s3 = nil
@@ -1462,17 +1444,17 @@ func (s *GoofysTest) TestIssue162(t *C) {
 		Key:    aws.String("dir1/l├â┬╢r 006.jpg"),
 		Body:   bytes.NewReader([]byte("foo")),
 	}
-	_, err := s.s3.PutObject(params)
+	_, err := s.s3.PutObject(context.Background(), params)
 	t.Assert(err, IsNil)
 
 	dir, err := s.LookUpInode(t, "dir1")
 	t.Assert(err, IsNil)
 
-	err = dir.Rename("l├â┬╢r 006.jpg", dir, "myfile.jpg")
+	err = dir.Rename(s.ctx, "l├â┬╢r 006.jpg", dir, "myfile.jpg")
 	t.Assert(err, IsNil)
 
-	resp, err := s.s3.HeadObject(&s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: aws.String("dir1/myfile.jpg")})
-	t.Assert(*resp.ContentLength, Equals, int64(3))
+	resp, err := s.s3.HeadObject(context.Background(), &s3.HeadObjectInput{Bucket: &s.fs.bucket, Key: aws.String("dir1/myfile.jpg")})
+	t.Assert(aws.ToInt64(resp.ContentLength), Equals, int64(3))
 }
 
 func (s *GoofysTest) TestXAttrGet(t *C) {
@@ -1485,7 +1467,7 @@ func (s *GoofysTest) TestXAttrGet(t *C) {
 	t.Assert(names, DeepEquals, []string{"s3.etag", "s3.storage-class", "user.name"})
 
 	_, err = file1.GetXattr("user.foobar")
-	t.Assert(xattr.IsNotExist(err), Equals, true)
+	t.Assert(err, Equals, syscall.ENODATA)
 
 	value, err := file1.GetXattr("s3.etag")
 	t.Assert(err, IsNil)
@@ -1504,7 +1486,7 @@ func (s *GoofysTest) TestXAttrGet(t *C) {
 		Parent: fuseops.RootInodeID,
 		Name:   "dir1",
 	}
-	err = s.fs.LookUpInode(nil, &lookup)
+	err = s.fs.LookUpInode(s.ctx, &lookup)
 	t.Assert(err, IsNil)
 
 	s.readDirIntoCache(t, lookup.Entry.Child)
@@ -1578,7 +1560,7 @@ func (s *GoofysTest) TestXAttrGetCached(t *C) {
 func (s *GoofysTest) TestXAttrCopied(t *C) {
 	root := s.getRoot(t)
 
-	err := root.Rename("file1", root, "file0")
+	err := root.Rename(s.ctx, "file1", root, "file0")
 	t.Assert(err, IsNil)
 
 	in, err := s.LookUpInode(t, "file0")
@@ -1606,13 +1588,13 @@ func (s *GoofysTest) TestXAttrSet(t *C) {
 	in, err := s.LookUpInode(t, "file1")
 	t.Assert(err, IsNil)
 
-	err = in.SetXattr("user.bar", []byte("hello"), xattr.REPLACE)
+	err = in.SetXattr("user.bar", []byte("hello"), 0x2) // XATTR_REPLACE
 	t.Assert(err, Equals, syscall.ENODATA)
 
-	err = in.SetXattr("user.bar", []byte("hello"), xattr.CREATE)
+	err = in.SetXattr("user.bar", []byte("hello"), 0x1) // XATTR_CREATE
 	t.Assert(err, IsNil)
 
-	err = in.SetXattr("user.bar", []byte("hello"), xattr.CREATE)
+	err = in.SetXattr("user.bar", []byte("hello"), 0x1) // XATTR_CREATE
 	t.Assert(err, Equals, syscall.EEXIST)
 
 	in, err = s.LookUpInode(t, "file1")
@@ -1624,7 +1606,7 @@ func (s *GoofysTest) TestXAttrSet(t *C) {
 
 	value = []byte("file1+%/#\x00")
 
-	err = in.SetXattr("user.bar", value, xattr.REPLACE)
+	err = in.SetXattr("user.bar", value, 0x2) // XATTR_REPLACE
 	t.Assert(err, IsNil)
 
 	in, err = s.LookUpInode(t, "file1")
@@ -1833,7 +1815,7 @@ func (s *GoofysTest) TestReadDirLookUp(t *C) {
 				Parent: fuseops.RootInodeID,
 				Name:   "file1",
 			}
-			err := s.fs.LookUpInode(nil, &lookup)
+			err := s.fs.LookUpInode(s.ctx, &lookup)
 			t.Assert(err, IsNil)
 		}()
 	}
@@ -1928,7 +1910,7 @@ func (s *GoofysTest) TestDirMtimeLs(t *C) {
 		Key:    aws.String("newfile"),
 		Body:   bytes.NewReader([]byte("foo")),
 	}
-	_, err := s.s3.PutObject(params)
+	_, err := s.s3.PutObject(context.Background(), params)
 	t.Assert(err, IsNil)
 
 	s.readDirIntoCache(t, fuseops.RootInodeID)
@@ -1968,12 +1950,8 @@ func (s *GoofysTest) TestRead403(t *C) {
 	fh, err := in.OpenFile()
 	t.Assert(err, IsNil)
 
-	s.fs.awsConfig.Credentials = credentials.AnonymousCredentials
-	s.fs.sess = session.New(s.fs.awsConfig)
+	s.fs.awsConfig.Credentials = aws.AnonymousCredentials{}
 	s.fs.s3 = s.fs.newS3()
-
-	// fake enable read-ahead
-	fh.seqReadAmount = uint64(READAHEAD_CHUNK)
 
 	buf := make([]byte, 5)
 
@@ -2079,7 +2057,7 @@ func (s *GoofysTest) TestDirMTime(t *C) {
 
 	time.Sleep(2 * time.Second)
 
-	dir2, err := dir1.MkDir("dir2")
+	dir2, err := dir1.MkDir(s.ctx, "dir2")
 	t.Assert(err, IsNil)
 
 	attr2, _ := dir2.GetAttributes()
@@ -2095,7 +2073,7 @@ func (s *GoofysTest) TestDirMTime(t *C) {
 	// simulate forget inode so we will retrieve the inode again
 	dir1.removeChild(dir2)
 
-	dir2, err = dir1.LookUp("dir2")
+	dir2, err = dir1.LookUp(s.ctx, "dir2")
 	t.Assert(err, IsNil)
 
 	// the new time comes from S3 which only has seconds
@@ -2132,12 +2110,12 @@ func (s *GoofysTest) TestDirMTime(t *C) {
 		Key:    aws.String("dir2/newfile"),
 		Body:   bytes.NewReader([]byte("foo")),
 	}
-	_, err = s.s3.PutObject(params)
+	_, err = s.s3.PutObject(context.Background(), params)
 	t.Assert(err, IsNil)
 
 	s.readDirIntoCache(t, dir2.Id)
 
-	newfile, err := dir2.LookUp("newfile")
+	newfile, err := dir2.LookUp(s.ctx, "newfile")
 	t.Assert(err, IsNil)
 
 	attr2New, _ := dir2.GetAttributes()
@@ -2169,9 +2147,9 @@ func (s *GoofysTest) TestDirMTimeNoTTL(t *C) {
 
 func (s *GoofysTest) TestIssue326(t *C) {
 	root := s.getRoot(t)
-	_, err := root.MkDir("folder@name.something")
+	_, err := root.MkDir(s.ctx, "folder@name.something")
 	t.Assert(err, IsNil)
-	_, err = root.MkDir("folder#1#")
+	_, err = root.MkDir(s.ctx, "folder#1#")
 	t.Assert(err, IsNil)
 
 	s.readDirIntoCache(t, root.Id)

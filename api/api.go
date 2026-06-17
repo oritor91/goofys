@@ -11,9 +11,9 @@ import (
 	"os/exec"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseutil"
@@ -82,11 +82,7 @@ func Mount(
 	var flags FlagStorage
 	copier.Copy(&flags, config)
 
-	awsConfig := (&aws.Config{
-		Region: &flags.Region,
-		Logger: GetLogger("s3"),
-		//LogLevel: aws.LogLevel(aws.LogDebug),
-	}).WithHTTPClient(&http.Client{
+	httpClient := &http.Client{
 		Transport: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
 			DialContext: (&net.Dialer{
@@ -101,27 +97,34 @@ func Mount(
 			ExpectContinueTimeout: 10 * time.Second,
 		},
 		Timeout: flags.HTTPTimeout,
-	}).
-		WithS3DisableContentMD5Validation(true)
+	}
+
+	awsConfig := aws.Config{
+		Region:     flags.Region,
+		HTTPClient: httpClient,
+		Logger:     GetLogger("s3"),
+		// v1 used WithS3DisableContentMD5Validation(true); v2 replaced
+		// Content-MD5 with CRC checksums, so only compute them when the
+		// request actually requires it (keeps non-AWS S3 servers happy).
+		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
+		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
+	}
 
 	if config.AccessKey != "" {
-		awsConfig.Credentials = credentials.NewStaticCredentials(config.AccessKey, config.SecretKey, "")
+		awsConfig.Credentials = credentials.NewStaticCredentialsProvider(config.AccessKey, config.SecretKey, "")
 	} else if len(flags.Profile) > 0 {
-		opts := session.Options{
-			Profile:           flags.Profile,
-			SharedConfigState: session.SharedConfigEnable,
+		c, err := awsconfig.LoadDefaultConfig(ctx,
+			awsconfig.WithSharedConfigProfile(flags.Profile))
+		if err == nil {
+			awsConfig.Credentials = c.Credentials
 		}
-		s := session.Must(session.NewSessionWithOptions(opts))
-		awsConfig.Credentials = s.Config.Credentials
 	}
 
 	if len(flags.Endpoint) > 0 {
-		awsConfig.Endpoint = &flags.Endpoint
+		awsConfig.BaseEndpoint = &flags.Endpoint
 	}
 
-	awsConfig.S3ForcePathStyle = aws.Bool(true)
-
-	fs = NewGoofys(ctx, bucketName, awsConfig, &flags)
+	fs = NewGoofys(ctx, bucketName, &awsConfig, &flags)
 	if fs == nil {
 		err = fmt.Errorf("Mount: initialization failed")
 		return

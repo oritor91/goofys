@@ -15,6 +15,7 @@
 package internal
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"os"
@@ -24,8 +25,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/jacobsa/fuse"
 	"github.com/jacobsa/fuse/fuseops"
@@ -73,7 +75,7 @@ func NewInode(fs *Goofys, parent *Inode, name *string, fullName *string) (inode 
 	flags := fs.flags
 	var reporter *metricReporter
 	if len(flags.CwMetricNs) > 0 && len(flags.CwId) > 0 {
-		reporter = NewMetricReporter(fs.sess, flags.CwMetricNs, flags.CwId)
+		reporter = NewMetricReporter(fs.awsConfig, flags.CwMetricNs, flags.CwId)
 	}
 
 	inode = &Inode{
@@ -262,10 +264,10 @@ func (parent *Inode) insertChildUnlocked(inode *Inode) {
 	}
 }
 
-func (parent *Inode) LookUp(name string) (inode *Inode, err error) {
+func (parent *Inode) LookUp(ctx context.Context, name string) (inode *Inode, err error) {
 	parent.logFuse("Inode.LookUp", name)
 
-	inode, err = parent.LookUpInodeMaybeDir(name, parent.getChildName(name))
+	inode, err = parent.LookUpInodeMaybeDir(ctx, name, parent.getChildName(name))
 	if err != nil {
 		return nil, err
 	}
@@ -306,7 +308,7 @@ func (inode *Inode) DeRef(n uint64) (stale bool) {
 	return
 }
 
-func (parent *Inode) Unlink(name string) (err error) {
+func (parent *Inode) Unlink(ctx context.Context, name string) (err error) {
 	parent.logFuse("Unlink", name)
 
 	fullName := parent.getChildName(name)
@@ -316,7 +318,7 @@ func (parent *Inode) Unlink(name string) (err error) {
 		Key:    parent.fs.key(fullName),
 	}
 
-	resp, err := parent.fs.s3.DeleteObject(params)
+	resp, err := parent.fs.s3.DeleteObject(ctx, params)
 	if err != nil {
 		return mapAwsError(err)
 	}
@@ -362,7 +364,7 @@ func (parent *Inode) Create(
 	return
 }
 
-func (parent *Inode) MkDir(
+func (parent *Inode) MkDir(ctx context.Context,
 	name string) (inode *Inode, err error) {
 
 	parent.logFuse("MkDir", name)
@@ -377,13 +379,13 @@ func (parent *Inode) MkDir(
 	}
 
 	if fs.flags.UseSSE {
-		params.ServerSideEncryption = &fs.sseType
+		params.ServerSideEncryption = fs.sseType
 		if fs.flags.UseKMS && fs.flags.KMSKeyID != "" {
 			params.SSEKMSKeyId = &fs.flags.KMSKeyID
 		}
 	}
 
-	_, err = fs.s3.PutObject(params)
+	_, err = fs.s3.PutObject(ctx, params)
 	if err != nil {
 		err = mapAwsError(err)
 		return
@@ -402,17 +404,17 @@ func (parent *Inode) MkDir(
 	return
 }
 
-func isEmptyDir(fs *Goofys, fullName string) (isDir bool, err error) {
+func isEmptyDir(ctx context.Context, fs *Goofys, fullName string) (isDir bool, err error) {
 	fullName += "/"
 
 	params := &s3.ListObjectsInput{
 		Bucket:    &fs.bucket,
 		Delimiter: aws.String("/"),
-		MaxKeys:   aws.Int64(2),
+		MaxKeys:   aws.Int32(2),
 		Prefix:    fs.key(fullName),
 	}
 
-	resp, err := fs.s3.ListObjects(params)
+	resp, err := fs.s3.ListObjects(ctx, params)
 	if err != nil {
 		return false, mapAwsError(err)
 	}
@@ -434,13 +436,13 @@ func isEmptyDir(fs *Goofys, fullName string) (isDir bool, err error) {
 	return
 }
 
-func (parent *Inode) RmDir(name string) (err error) {
+func (parent *Inode) RmDir(ctx context.Context, name string) (err error) {
 	parent.logFuse("Rmdir", name)
 
 	fullName := parent.getChildName(name)
 	fs := parent.fs
 
-	isDir, err := isEmptyDir(fs, fullName)
+	isDir, err := isEmptyDir(ctx, fs, fullName)
 	if err != nil {
 		return
 	}
@@ -455,7 +457,7 @@ func (parent *Inode) RmDir(name string) (err error) {
 		Key:    fs.key(fullName),
 	}
 
-	_, err = fs.s3.DeleteObject(params)
+	_, err = fs.s3.DeleteObject(ctx, params)
 	if err != nil {
 		return mapAwsError(err)
 	}
@@ -494,17 +496,17 @@ func (inode *Inode) fillXattrFromHead(resp *s3.HeadObjectOutput) {
 	if resp.ETag != nil {
 		inode.s3Metadata["etag"] = []byte(*resp.ETag)
 	}
-	if resp.StorageClass != nil {
-		inode.s3Metadata["storage-class"] = []byte(*resp.StorageClass)
+	if resp.StorageClass != "" {
+		inode.s3Metadata["storage-class"] = []byte(resp.StorageClass)
 	} else {
 		inode.s3Metadata["storage-class"] = []byte("STANDARD")
 	}
 
 	for k, v := range resp.Metadata {
 		k = strings.ToLower(k)
-		value, err := url.PathUnescape(*v)
+		value, err := url.PathUnescape(v)
 		if err != nil {
-			value = *v
+			value = v
 		}
 		inode.userMetadata[k] = []byte(value)
 	}
@@ -521,7 +523,7 @@ func (inode *Inode) fillXattr() (err error) {
 		fs := inode.fs
 
 		params := &s3.HeadObjectInput{Bucket: &fs.bucket, Key: fs.key(fullName)}
-		resp, err := fs.s3.HeadObject(params)
+		resp, err := fs.s3.HeadObject(context.Background(), params)
 		if err != nil {
 			err = mapAwsError(err)
 			if err == fuse.ENOENT {
@@ -573,17 +575,17 @@ func (inode *Inode) getXattrMap(name string, userOnly bool) (
 	return
 }
 
-func convertMetadata(meta map[string][]byte) (metadata map[string]*string) {
-	metadata = make(map[string]*string)
+func convertMetadata(meta map[string][]byte) (metadata map[string]string) {
+	metadata = make(map[string]string)
 	for k, v := range meta {
-		metadata[k] = aws.String(xattrEscape(v))
+		metadata[k] = xattrEscape(v)
 	}
 	return
 }
 
 // LOCKS_REQUIRED(inode.mu)
 func (inode *Inode) updateXattr() (err error) {
-	err = copyObjectMaybeMultipart(inode.fs, int64(inode.Attributes.Size),
+	err = copyObjectMaybeMultipart(context.Background(), inode.fs, int64(inode.Attributes.Size),
 		*inode.FullName(), *inode.FullName(),
 		aws.String(string(inode.s3Metadata["etag"])), convertMetadata(inode.userMetadata))
 	return
@@ -670,11 +672,11 @@ func (inode *Inode) ListXattr() ([]string, error) {
 		return nil, err
 	}
 
-	for k, _ := range inode.s3Metadata {
+	for k := range inode.s3Metadata {
 		xattrs = append(xattrs, "s3."+k)
 	}
 
-	for k, _ := range inode.userMetadata {
+	for k := range inode.userMetadata {
 		xattrs = append(xattrs, "user."+k)
 	}
 
@@ -691,7 +693,7 @@ func (inode *Inode) OpenFile() (fh *FileHandle, err error) {
 	return
 }
 
-func (parent *Inode) Rename(from string, newParent *Inode, to string) (err error) {
+func (parent *Inode) Rename(ctx context.Context, from string, newParent *Inode, to string) (err error) {
 	parent.logFuse("Rename", from, newParent.getChildName(to))
 
 	fromFullName := parent.getChildName(from)
@@ -701,7 +703,7 @@ func (parent *Inode) Rename(from string, newParent *Inode, to string) (err error
 	var fromIsDir bool
 	var toIsDir bool
 
-	fromIsDir, err = isEmptyDir(fs, fromFullName)
+	fromIsDir, err = isEmptyDir(ctx, fs, fromFullName)
 	if err != nil {
 		// we don't support renaming a directory that's not empty
 		return
@@ -709,13 +711,13 @@ func (parent *Inode) Rename(from string, newParent *Inode, to string) (err error
 
 	toFullName := newParent.getChildName(to)
 
-	toIsDir, err = isEmptyDir(fs, toFullName)
+	toIsDir, err = isEmptyDir(ctx, fs, toFullName)
 	if err != nil {
 		return
 	}
 
 	if fromIsDir && !toIsDir {
-		_, err = fs.s3.HeadObject(&s3.HeadObjectInput{
+		_, err = fs.s3.HeadObject(ctx, &s3.HeadObjectInput{
 			Bucket: &fs.bucket,
 			Key:    fs.key(toFullName),
 		})
@@ -738,11 +740,11 @@ func (parent *Inode) Rename(from string, newParent *Inode, to string) (err error
 		size = 0
 	}
 
-	err = renameObject(fs, size, fromFullName, toFullName)
+	err = renameObject(ctx, fs, size, fromFullName, toFullName)
 	return
 }
 
-func mpuCopyPart(fs *Goofys, from string, to string, mpuId string, bytes string, part int64,
+func mpuCopyPart(ctx context.Context, fs *Goofys, from string, to string, mpuId string, bytes string, part int32,
 	wg *sync.WaitGroup, srcEtag *string, etag **string, errout *error) {
 
 	defer func() {
@@ -758,12 +760,12 @@ func mpuCopyPart(fs *Goofys, from string, to string, mpuId string, bytes string,
 		UploadId:          &mpuId,
 		CopySourceRange:   &bytes,
 		CopySourceIfMatch: srcEtag,
-		PartNumber:        &part,
+		PartNumber:        aws.Int32(part),
 	}
 
 	s3Log.Debug(params)
 
-	resp, err := fs.s3.UploadPartCopy(params)
+	resp, err := fs.s3.UploadPartCopy(ctx, params)
 	if err != nil {
 		s3Log.Errorf("UploadPartCopy %v = %v", params, err)
 		*errout = mapAwsError(err)
@@ -784,7 +786,7 @@ func sizeToParts(size int64) int {
 	return nParts
 }
 
-func mpuCopyParts(fs *Goofys, size int64, from string, to string, mpuId string,
+func mpuCopyParts(ctx context.Context, fs *Goofys, size int64, from string, to string, mpuId string,
 	wg *sync.WaitGroup, srcEtag *string, etags []*string, err *error) {
 
 	const PART_SIZE = 5 * 1024 * 1024 * 1024
@@ -801,12 +803,12 @@ func mpuCopyParts(fs *Goofys, size int64, from string, to string, mpuId string,
 		bytes := fmt.Sprintf("bytes=%v-%v", rangeFrom, rangeTo-1)
 
 		wg.Add(1)
-		go mpuCopyPart(fs, from, to, mpuId, bytes, i, wg, srcEtag, &etags[i-1], err)
+		go mpuCopyPart(ctx, fs, from, to, mpuId, bytes, int32(i), wg, srcEtag, &etags[i-1], err)
 	}
 }
 
-func copyObjectMultipart(fs *Goofys, size int64, from string, to string, mpuId string,
-	srcEtag *string, metadata map[string]*string) (err error) {
+func copyObjectMultipart(ctx context.Context, fs *Goofys, size int64, from string, to string, mpuId string,
+	srcEtag *string, metadata map[string]string) (err error) {
 	var wg sync.WaitGroup
 	nParts := sizeToParts(size)
 	etags := make([]*string, nParts)
@@ -815,23 +817,23 @@ func copyObjectMultipart(fs *Goofys, size int64, from string, to string, mpuId s
 		params := &s3.CreateMultipartUploadInput{
 			Bucket:       &fs.bucket,
 			Key:          fs.key(to),
-			StorageClass: &fs.flags.StorageClass,
+			StorageClass: types.StorageClass(fs.flags.StorageClass),
 			ContentType:  fs.getMimeType(to),
 			Metadata:     metadata,
 		}
 
 		if fs.flags.UseSSE {
-			params.ServerSideEncryption = &fs.sseType
+			params.ServerSideEncryption = fs.sseType
 			if fs.flags.UseKMS && fs.flags.KMSKeyID != "" {
 				params.SSEKMSKeyId = &fs.flags.KMSKeyID
 			}
 		}
 
 		if fs.flags.ACL != "" {
-			params.ACL = &fs.flags.ACL
+			params.ACL = types.ObjectCannedACL(fs.flags.ACL)
 		}
 
-		resp, err := fs.s3.CreateMultipartUpload(params)
+		resp, err := fs.s3.CreateMultipartUpload(ctx, params)
 		if err != nil {
 			return mapAwsError(err)
 		}
@@ -839,17 +841,17 @@ func copyObjectMultipart(fs *Goofys, size int64, from string, to string, mpuId s
 		mpuId = *resp.UploadId
 	}
 
-	mpuCopyParts(fs, size, from, to, mpuId, &wg, srcEtag, etags, &err)
+	mpuCopyParts(ctx, fs, size, from, to, mpuId, &wg, srcEtag, etags, &err)
 	wg.Wait()
 
 	if err != nil {
 		return
 	} else {
-		parts := make([]*s3.CompletedPart, nParts)
+		parts := make([]types.CompletedPart, nParts)
 		for i := 0; i < nParts; i++ {
-			parts[i] = &s3.CompletedPart{
+			parts[i] = types.CompletedPart{
 				ETag:       etags[i],
-				PartNumber: aws.Int64(int64(i + 1)),
+				PartNumber: aws.Int32(int32(i + 1)),
 			}
 		}
 
@@ -857,14 +859,14 @@ func copyObjectMultipart(fs *Goofys, size int64, from string, to string, mpuId s
 			Bucket:   &fs.bucket,
 			Key:      fs.key(to),
 			UploadId: &mpuId,
-			MultipartUpload: &s3.CompletedMultipartUpload{
+			MultipartUpload: &types.CompletedMultipartUpload{
 				Parts: parts,
 			},
 		}
 
 		s3Log.Debug(params)
 
-		_, err := fs.s3.CompleteMultipartUpload(params)
+		_, err := fs.s3.CompleteMultipartUpload(ctx, params)
 		if err != nil {
 			s3Log.Errorf("Complete MPU %v = %v", params, err)
 			return mapAwsError(err)
@@ -874,16 +876,16 @@ func copyObjectMultipart(fs *Goofys, size int64, from string, to string, mpuId s
 	return
 }
 
-func copyObjectMaybeMultipart(fs *Goofys, size int64, from string, to string, srcEtag *string, metadata map[string]*string) (err error) {
+func copyObjectMaybeMultipart(ctx context.Context, fs *Goofys, size int64, from string, to string, srcEtag *string, metadata map[string]string) (err error) {
 
 	if size == -1 || srcEtag == nil || metadata == nil {
 		params := &s3.HeadObjectInput{Bucket: &fs.bucket, Key: fs.key(from)}
-		resp, err := fs.s3.HeadObject(params)
+		resp, err := fs.s3.HeadObject(ctx, params)
 		if err != nil {
 			return mapAwsError(err)
 		}
 
-		size = *resp.ContentLength
+		size = aws.ToInt64(resp.ContentLength)
 		metadata = resp.Metadata
 		srcEtag = resp.ETag
 	}
@@ -891,7 +893,7 @@ func copyObjectMaybeMultipart(fs *Goofys, size int64, from string, to string, sr
 	from = fs.bucket + "/" + *fs.key(from)
 
 	if !fs.gcs && size > 5*1024*1024*1024 {
-		return copyObjectMultipart(fs, size, from, to, "", srcEtag, metadata)
+		return copyObjectMultipart(ctx, fs, size, from, to, "", srcEtag, metadata)
 	}
 
 	storageClass := fs.flags.StorageClass
@@ -903,26 +905,26 @@ func copyObjectMaybeMultipart(fs *Goofys, size int64, from string, to string, sr
 		Bucket:            &fs.bucket,
 		CopySource:        aws.String(pathEscape(from)),
 		Key:               fs.key(to),
-		StorageClass:      &storageClass,
+		StorageClass:      types.StorageClass(storageClass),
 		ContentType:       fs.getMimeType(to),
 		Metadata:          metadata,
-		MetadataDirective: aws.String(s3.MetadataDirectiveReplace),
+		MetadataDirective: types.MetadataDirectiveReplace,
 	}
 
 	s3Log.Debug(params)
 
 	if fs.flags.UseSSE {
-		params.ServerSideEncryption = &fs.sseType
+		params.ServerSideEncryption = fs.sseType
 		if fs.flags.UseKMS && fs.flags.KMSKeyID != "" {
 			params.SSEKMSKeyId = &fs.flags.KMSKeyID
 		}
 	}
 
 	if fs.flags.ACL != "" {
-		params.ACL = &fs.flags.ACL
+		params.ACL = types.ObjectCannedACL(fs.flags.ACL)
 	}
 
-	resp, err := fs.s3.CopyObject(params)
+	resp, err := fs.s3.CopyObject(ctx, params)
 	if err != nil {
 		s3Log.Errorf("CopyObject %v = %v", params, err)
 		err = mapAwsError(err)
@@ -932,8 +934,8 @@ func copyObjectMaybeMultipart(fs *Goofys, size int64, from string, to string, sr
 	return
 }
 
-func renameObject(fs *Goofys, size int64, fromFullName string, toFullName string) (err error) {
-	err = copyObjectMaybeMultipart(fs, size, fromFullName, toFullName, nil, nil)
+func renameObject(ctx context.Context, fs *Goofys, size int64, fromFullName string, toFullName string) (err error) {
+	err = copyObjectMaybeMultipart(ctx, fs, size, fromFullName, toFullName, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -943,7 +945,7 @@ func renameObject(fs *Goofys, size int64, fromFullName string, toFullName string
 		Key:    fs.key(fromFullName),
 	}
 
-	_, err = fs.s3.DeleteObject(delParams)
+	_, err = fs.s3.DeleteObject(ctx, delParams)
 	if err != nil {
 		return mapAwsError(err)
 	}
@@ -990,7 +992,7 @@ func sealPastDirs(dirs map[*Inode]bool, d *Inode) {
 	dirs[d] = false
 }
 
-func (parent *Inode) insertSubTree(path string, obj *s3.Object, dirs map[*Inode]bool) {
+func (parent *Inode) insertSubTree(path string, obj types.Object, dirs map[*Inode]bool) {
 	fs := parent.fs
 	slash := strings.Index(path, "/")
 	if slash == -1 {
@@ -1068,9 +1070,9 @@ func (parent *Inode) readDirFromCache(offset fuseops.DirOffset) (en *DirHandleEn
 	return
 }
 
-func (parent *Inode) LookUpInodeNotDir(name string, c chan s3.HeadObjectOutput, errc chan error) {
+func (parent *Inode) LookUpInodeNotDir(ctx context.Context, name string, c chan s3.HeadObjectOutput, errc chan error) {
 	params := &s3.HeadObjectInput{Bucket: &parent.fs.bucket, Key: parent.fs.key(name)}
-	resp, err := parent.fs.s3.HeadObject(params)
+	resp, err := parent.fs.s3.HeadObject(ctx, params)
 	if err != nil {
 		errc <- mapAwsError(err)
 		return
@@ -1080,15 +1082,15 @@ func (parent *Inode) LookUpInodeNotDir(name string, c chan s3.HeadObjectOutput, 
 	c <- *resp
 }
 
-func (parent *Inode) LookUpInodeDir(name string, c chan s3.ListObjectsOutput, errc chan error) {
+func (parent *Inode) LookUpInodeDir(ctx context.Context, name string, c chan s3.ListObjectsOutput, errc chan error) {
 	params := &s3.ListObjectsInput{
 		Bucket:    &parent.fs.bucket,
 		Delimiter: aws.String("/"),
-		MaxKeys:   aws.Int64(1),
+		MaxKeys:   aws.Int32(1),
 		Prefix:    parent.fs.key(name + "/"),
 	}
 
-	resp, err := parent.fs.s3.ListObjects(params)
+	resp, err := parent.fs.s3.ListObjects(ctx, params)
 	if err != nil {
 		errc <- mapAwsError(err)
 		return
@@ -1099,7 +1101,7 @@ func (parent *Inode) LookUpInodeDir(name string, c chan s3.ListObjectsOutput, er
 }
 
 // returned inode has nil Id
-func (parent *Inode) LookUpInodeMaybeDir(name string, fullName string) (inode *Inode, err error) {
+func (parent *Inode) LookUpInodeMaybeDir(ctx context.Context, name string, fullName string) (inode *Inode, err error) {
 	errObjectChan := make(chan error, 1)
 	objectChan := make(chan s3.HeadObjectOutput, 1)
 	errDirBlobChan := make(chan error, 1)
@@ -1114,13 +1116,13 @@ func (parent *Inode) LookUpInodeMaybeDir(name string, fullName string) (inode *I
 		panic("s3 disabled")
 	}
 
-	go parent.LookUpInodeNotDir(fullName, objectChan, errObjectChan)
+	go parent.LookUpInodeNotDir(ctx, fullName, objectChan, errObjectChan)
 	if !parent.fs.flags.Cheap {
-		go parent.LookUpInodeNotDir(fullName+"/", dirBlobChan, errDirBlobChan)
+		go parent.LookUpInodeNotDir(ctx, fullName+"/", dirBlobChan, errDirBlobChan)
 		if !parent.fs.flags.ExplicitDir {
 			errDirChan = make(chan error, 1)
 			dirChan = make(chan s3.ListObjectsOutput, 1)
-			go parent.LookUpInodeDir(fullName, dirChan, errDirChan)
+			go parent.LookUpInodeDir(ctx, fullName, dirChan, errDirChan)
 		}
 	}
 
@@ -1131,7 +1133,7 @@ func (parent *Inode) LookUpInodeMaybeDir(name string, fullName string) (inode *I
 			// XXX/TODO if both object and object/ exists, return dir
 			inode = NewInode(parent.fs, parent, &name, &fullName)
 			inode.Attributes = InodeAttributes{
-				Size:  uint64(aws.Int64Value(resp.ContentLength)),
+				Size:  uint64(aws.ToInt64(resp.ContentLength)),
 				Mtime: *resp.LastModified,
 			}
 
@@ -1157,8 +1159,8 @@ func (parent *Inode) LookUpInodeMaybeDir(name string, fullName string) (inode *I
 					if entry.ETag != nil {
 						inode.s3Metadata["etag"] = []byte(*entry.ETag)
 					}
-					if entry.StorageClass != nil {
-						inode.s3Metadata["storage-class"] = []byte(*entry.StorageClass)
+					if entry.StorageClass != "" {
+						inode.s3Metadata["storage-class"] = []byte(entry.StorageClass)
 					}
 
 				}
@@ -1192,7 +1194,7 @@ func (parent *Inode) LookUpInodeMaybeDir(name string, fullName string) (inode *I
 		switch checking {
 		case 2:
 			if parent.fs.flags.Cheap {
-				go parent.LookUpInodeNotDir(fullName+"/", dirBlobChan, errDirBlobChan)
+				go parent.LookUpInodeNotDir(ctx, fullName+"/", dirBlobChan, errDirBlobChan)
 			}
 		case 1:
 			if parent.fs.flags.ExplicitDir {
@@ -1201,7 +1203,7 @@ func (parent *Inode) LookUpInodeMaybeDir(name string, fullName string) (inode *I
 			} else if parent.fs.flags.Cheap {
 				errDirChan = make(chan error, 1)
 				dirChan = make(chan s3.ListObjectsOutput, 1)
-				go parent.LookUpInodeDir(fullName, dirChan, errDirChan)
+				go parent.LookUpInodeDir(ctx, fullName, dirChan, errDirChan)
 			}
 			break
 		doneCase:

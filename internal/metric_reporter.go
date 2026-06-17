@@ -1,28 +1,28 @@
 package internal
 
 import (
+	"context"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/cloudwatch"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	cwtypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 )
 
 type metricReporter struct {
 	readDurations  []time.Duration
 	lastUpdateTime time.Time
-	cw             *cloudwatch.CloudWatch
+	cw             *cloudwatch.Client
 	cwMetric       string
 	cwId           string
 }
 
-func NewMetricReporter(sess *session.Session, cwMetric, cwId string) *metricReporter {
+func NewMetricReporter(cfg *aws.Config, cwMetric, cwId string) *metricReporter {
 	res := &metricReporter{}
 	res.lastUpdateTime = time.Now()
 	res.cwId = cwId
 	res.cwMetric = cwMetric
-
-	res.cw = cloudwatch.New(sess)
+	res.cw = cloudwatch.NewFromConfig(*cfg)
 	return res
 }
 
@@ -50,15 +50,15 @@ func (reporter *metricReporter) Report(start time.Time, end time.Time) {
 	reporter.readDurations = reporter.readDurations[:0]
 
 	cw := reporter.cw
-	_, err := cw.PutMetricData(&cloudwatch.PutMetricDataInput{
+	_, err := cw.PutMetricData(context.Background(), &cloudwatch.PutMetricDataInput{
 		Namespace: aws.String(reporter.cwMetric),
-		MetricData: []*cloudwatch.MetricDatum{
-			&cloudwatch.MetricDatum{
+		MetricData: []cwtypes.MetricDatum{
+			{
 				MetricName: aws.String("ReadCallDuration"),
-				Unit:       aws.String("Milliseconds"),
+				Unit:       cwtypes.StandardUnitMilliseconds,
 				Value:      aws.Float64(avg),
-				Dimensions: []*cloudwatch.Dimension{
-					&cloudwatch.Dimension{
+				Dimensions: []cwtypes.Dimension{
+					{
 						Name:  aws.String("By run-name/clip"),
 						Value: aws.String(reporter.cwId),
 					},

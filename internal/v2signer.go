@@ -15,6 +15,7 @@
 package internal
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base64"
@@ -26,10 +27,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/private/protocol/rest"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 var (
@@ -62,59 +62,69 @@ var subresources = []string{
 }
 
 type signer struct {
-	// Values that must be populated from the request
-	Request     *http.Request
-	Time        time.Time
-	Credentials *credentials.Credentials
-	Debug       aws.LogLevelType
-	Logger      aws.Logger
-	pathStyle   bool
-	bucket      string
+	Request   *http.Request
+	Time      time.Time
+	AccessKey string
+	SecretKey string
+	Token     string
+	pathStyle bool
 
 	Query        url.Values
 	stringToSign string
 	signature    string
 }
 
-// Sign requests with signature version 2.
-//
-// Will sign the requests with the service config's Credentials object
-// Signing is skipped if the credentials is the credentials.AnonymousCredentials
-// object.
-func SignV2(req *request.Request) {
-	// If the request does not need to be signed ignore the signing of the
-	// request if the AnonymousCredentials object is used.
-	if req.Config.Credentials == credentials.AnonymousCredentials {
-		return
-	}
+// makeSignV2Middleware returns a smithy FinalizeMiddleware that signs requests with AWS Signature Version 2.
+// This is used for S3-compatible endpoints that don't support SigV4.
+func makeSignV2Middleware(cfg *aws.Config) func(*middleware.Stack) error {
+	return func(stack *middleware.Stack) error {
+		return stack.Finalize.Add(middleware.FinalizeMiddlewareFunc(
+			"goofys/SignV2",
+			func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
+				req, ok := in.Request.(*smithyhttp.Request)
+				if !ok {
+					return next.HandleFinalize(ctx, in)
+				}
 
-	v2 := signer{
-		Request:     req.HTTPRequest,
-		Time:        req.Time,
-		Credentials: req.Config.Credentials,
-		Debug:       req.Config.LogLevel.Value(),
-		Logger:      req.Config.Logger,
-		pathStyle:   aws.BoolValue(req.Config.S3ForcePathStyle),
-	}
+				creds, err := cfg.Credentials.Retrieve(ctx)
+				if err != nil {
+					return middleware.FinalizeOutput{}, middleware.Metadata{}, fmt.Errorf("v2signer: retrieve credentials: %w", err)
+				}
 
-	req.Error = v2.Sign()
+				// skip signing for anonymous credentials
+				if creds.AccessKeyID == "" && creds.SecretAccessKey == "" {
+					return next.HandleFinalize(ctx, in)
+				}
+
+				v2 := signer{
+					Request:   req.Request,
+					Time:      time.Now().UTC(),
+					AccessKey: creds.AccessKeyID,
+					SecretKey: creds.SecretAccessKey,
+					Token:     creds.SessionToken,
+					pathStyle: true,
+				}
+
+				if err := v2.Sign(); err != nil {
+					return middleware.FinalizeOutput{}, middleware.Metadata{}, err
+				}
+
+				return next.HandleFinalize(ctx, in)
+			},
+		), middleware.Before)
+	}
 }
 
 func (v2 *signer) Sign() error {
-	credValue, err := v2.Credentials.Get()
-	if err != nil {
-		return err
-	}
-
 	v2.Query = v2.Request.URL.Query()
 
 	contentMD5 := v2.Request.Header.Get("Content-MD5")
 	contentType := v2.Request.Header.Get("Content-Type")
-	date := v2.Time.UTC().Format(timeFormat)
+	date := v2.Time.Format(timeFormat)
 	v2.Request.Header.Set("x-amz-date", date)
 
-	if credValue.SessionToken != "" {
-		v2.Request.Header.Set("x-amz-security-token", credValue.SessionToken)
+	if v2.Token != "" {
+		v2.Request.Header.Set("x-amz-security-token", v2.Token)
 	}
 
 	// in case this is a retry, ensure no signature present
@@ -131,7 +141,7 @@ func (v2 *signer) Sign() error {
 	} else {
 		uri = v2.Request.URL.Path
 	}
-	path := rest.EscapePath(uri, false)
+	path := pathEscape(uri)
 	if !v2.pathStyle {
 		host := strings.SplitN(v2.Request.URL.Host, ".", 2)[0]
 		path = "/" + host + uri
@@ -186,27 +196,11 @@ func (v2 *signer) Sign() error {
 	// build the canonical string for the V2 signature
 	v2.stringToSign = strings.Join(tmp, "\n")
 
-	hash := hmac.New(sha1.New, []byte(credValue.SecretAccessKey))
+	hash := hmac.New(sha1.New, []byte(v2.SecretKey))
 	hash.Write([]byte(v2.stringToSign))
 	v2.signature = base64.StdEncoding.EncodeToString(hash.Sum(nil))
 	v2.Request.Header.Set("Authorization",
-		"AWS "+credValue.AccessKeyID+":"+v2.signature)
-
-	if v2.Debug.Matches(aws.LogDebugWithSigning) {
-		v2.logSigningInfo()
-	}
+		"AWS "+v2.AccessKey+":"+v2.signature)
 
 	return nil
-}
-
-const logSignInfoMsg = `DEBUG: Request Signature:
----[ STRING TO SIGN ]--------------------------------
-%s
----[ SIGNATURE ]-------------------------------------
-%s
------------------------------------------------------`
-
-func (v2 *signer) logSigningInfo() {
-	msg := fmt.Sprintf(logSignInfoMsg, v2.stringToSign, v2.Request.Header.Get("Authorization"))
-	v2.Logger.Log(msg)
 }

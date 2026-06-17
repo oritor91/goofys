@@ -34,7 +34,7 @@ var flagCategories map[string]string
 // Set up custom help text for goofys; in particular the usage section.
 func filterCategory(flags []cli.Flag, category string) (ret []cli.Flag) {
 	for _, f := range flags {
-		if flagCategories[f.Names()[0]] == category {
+		if flagCategories[strings.SplitN(f.GetName(), ",", 2)[0]] == category {
 			ret = append(ret, f)
 		}
 	}
