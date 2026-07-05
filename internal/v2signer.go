@@ -86,6 +86,9 @@ func makeSignV2Middleware(cfg *aws.Config) func(*middleware.Stack) error {
 					return next.HandleFinalize(ctx, in)
 				}
 
+				if cfg.Credentials == nil {
+					return middleware.FinalizeOutput{}, middleware.Metadata{}, fmt.Errorf("v2signer: no credentials provider configured")
+				}
 				creds, err := cfg.Credentials.Retrieve(ctx)
 				if err != nil {
 					return middleware.FinalizeOutput{}, middleware.Metadata{}, fmt.Errorf("v2signer: retrieve credentials: %w", err)
