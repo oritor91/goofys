@@ -17,34 +17,17 @@
 package internal
 
 import (
-	"os/user"
-	"strconv"
+	"os"
 )
 
 // Return the UID and GID of this process.
+//
+// This intentionally avoids os/user.Current(), which requires either cgo or
+// a matching /etc/passwd entry (or $USER/$HOME set) to resolve the current
+// UID/GID to a User struct. That fails inside minimal/statically-linked
+// containers running as an arbitrary UID with no passwd entry, e.g. CI
+// runners. os.Getuid/Getgid read the process's real IDs directly and need
+// no lookup.
 func MyUserAndGroup() (uid int, gid int) {
-	// Ask for the current user.
-	user, err := user.Current()
-	if err != nil {
-		panic(err)
-	}
-
-	// Parse UID.
-	uid64, err := strconv.ParseInt(user.Uid, 10, 32)
-	if err != nil {
-		log.Fatalf("Parsing UID (%s): %v", user.Uid, err)
-		return
-	}
-
-	// Parse GID.
-	gid64, err := strconv.ParseInt(user.Gid, 10, 32)
-	if err != nil {
-		log.Fatalf("Parsing GID (%s): %v", user.Gid, err)
-		return
-	}
-
-	uid = int(uid64)
-	gid = int(gid64)
-
-	return
+	return os.Getuid(), os.Getgid()
 }
